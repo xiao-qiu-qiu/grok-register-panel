@@ -22,6 +22,7 @@ from quality_probe import (
     MIN_GENERATION_MS,
     MIN_OUTPUT_TOKENS,
     SOFT_TPS,
+    load_account_records,
     load_auth_records,
     public_row,
     run_quality_scan,
@@ -42,6 +43,7 @@ except ImportError:
 
 CPA_DIR = Path(os.environ.get("CPA_AUTH_DIR", str(ROOT / "cpa_auth")))
 G2A_DIR = Path(os.environ.get("GROK2API_AUTH_DIR", str(ROOT / "grok2api_auth")))
+ACCOUNTS_DIR = Path(os.environ.get("GROK_ACCOUNTS_DIR", str(ROOT / "accounts")))
 CONFIG_FILE = ROOT / "config.json"
 LOG_DIR = ROOT / "log"
 REPORT_FILE = LOG_DIR / "quality_scan_report.json"
@@ -49,7 +51,7 @@ DEGRADED_EXPORT = LOG_DIR / "quality_degraded.jsonl"
 RISK_EXPORT = LOG_DIR / "quality_risk.jsonl"
 
 MAX_RECORDS = 2000
-VALID_SOURCES = ("cpa", "g2a", "all")
+VALID_SOURCES = ("cpa", "g2a", "all", "accounts")
 
 _lock = threading.Lock()
 _cancel = threading.Event()
@@ -169,6 +171,16 @@ def _resolve_auth_dirs(source: str) -> list[Path]:
     return dirs
 
 
+def _resolve_accounts_dirs() -> list[Path]:
+    cfg = _config()
+    base = CONFIG_FILE.parent
+    raw = str(os.environ.get("GROK_ACCOUNTS_DIR") or cfg.get("accounts_dir") or "").strip()
+    path = Path(raw) if raw else ACCOUNTS_DIR
+    if not path.is_absolute():
+        path = base / path
+    return [path]
+
+
 def resolve_probe_proxies(explicit: str = "", *, prefer_home: bool = True) -> list[str]:
     text = str(explicit or "").strip()
     if text:
@@ -199,7 +211,13 @@ def resolve_probe_proxies(explicit: str = "", *, prefer_home: bool = True) -> li
 def source_counts() -> dict:
     cpa = load_auth_records(_resolve_auth_dirs("cpa"))
     g2a = load_auth_records(_resolve_auth_dirs("g2a"))
-    return {"cpa": len(cpa), "g2a": len(g2a), "all": len(cpa) + len(g2a)}
+    accounts = load_account_records(_resolve_accounts_dirs())
+    return {
+        "cpa": len(cpa),
+        "g2a": len(g2a),
+        "all": len(cpa) + len(g2a),
+        "accounts": len(accounts),
+    }
 
 
 def _public_summary(summary: dict) -> dict:
@@ -396,8 +414,16 @@ def start_quality_scan(
         return {"ok": False, "error": "invalid limit"}
     cap = MAX_RECORDS if requested <= 0 else max(1, min(MAX_RECORDS, requested))
 
-    records = load_auth_records(_resolve_auth_dirs(normalized), limit=cap)
+    if normalized == "accounts":
+        records = load_account_records(_resolve_accounts_dirs(), limit=cap)
+    else:
+        records = load_auth_records(_resolve_auth_dirs(normalized), limit=cap)
     if not records:
+        if normalized == "accounts":
+            return {
+                "ok": False,
+                "error": "accounts/ 里没有可解析的账号（需要 email----sso 或纯 SSO 行）",
+            }
         return {"ok": False, "error": "没有可用的 CPA / Grok2API auth"}
 
     proxies = resolve_probe_proxies(proxy, prefer_home=bool(prefer_home))

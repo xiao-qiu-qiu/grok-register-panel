@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- 降智测试增加「账号文件」来源：只扫描顶层 `accounts/*.txt`（`email----sso` 或纯 SSO，不含子目录），先换 token 再短测，不写入 CPA。跳过 `mail_credentials` / 风控隔离文件。CLI：`scripts/check_quality.py --accounts`。
+
 ### Changed
 
 - Write Grok2API SSO to a single `sso.txt` under `grok2api_auth_dir` (one SSO per line, de-duplicated) instead of one `g2a-<email>.json` per account.

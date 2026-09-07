@@ -2194,7 +2194,7 @@ HTML = r"""<!DOCTYPE html>
           </details>
           <details class="faq-item" data-faq-item data-search="降智测试 quality probe 家宽 thinking tps 实聊 账号 批量">
             <summary>如何批量测试账号是否降智</summary>
-            <div class="faq-answer">入库短测默认关，打开 <code>quality_probe_on_register</code> 后才会在写入 CPA / Grok2API 时短测（短题，见到 thinking 即停）。存量号仍可打开顶部“降智测试”批量复测。缺少 thinking、Token/s 过高记为降智；401/403 / permission-denied 记为风控。命令行：<code>python scripts/check_quality.py --dir cpa_auth --from-config config.json</code>。脱敏结果写到 <code>log/quality_degraded.jsonl</code> 和 <code>log/quality_risk.jsonl</code>。</div>
+            <div class="faq-answer">入库短测默认关，打开 <code>quality_probe_on_register</code> 后才会在写入 CPA / Grok2API 时短测（短题，见到 thinking 即停）。存量号用顶部“降智测试”：CPA / Grok2API auth，或「账号文件」扫描 <code>accounts/*.txt</code>（<code>email----sso</code> 或纯 SSO，先换 token 再测，不写 CPA）。缺少 thinking、Token/s 过高记为降智；401/403 / permission-denied 记为风控。命令行：<code>python scripts/check_quality.py --dir cpa_auth --from-config config.json</code>，测账号文件加 <code>--accounts</code>。脱敏结果写到 <code>log/quality_degraded.jsonl</code> 和 <code>log/quality_risk.jsonl</code>。</div>
           </details>
           <details class="faq-item" data-faq-item data-search="卡住 浏览器 启动失败 turnstile 资料页 空页 并发 camoufox">
             <summary>注册卡在验证码、资料页或浏览器启动</summary>
@@ -2491,7 +2491,7 @@ HTML = r"""<!DOCTYPE html>
         <div>
           <div class="mail-source-kicker">Chat quality</div>
           <div class="page-title" id="quality-view-title">降智测试</div>
-          <p class="sso-view-subtitle">入库短测默认关。这里复测存量 auth：短题 + 见到 thinking 即停</p>
+          <p class="sso-view-subtitle">入库短测默认关。这里复测存量 auth，或导入 accounts/*.txt 后换 token 再短测</p>
         </div>
         <span class="sso-job mono" id="quality-heading-status">尚未扫描</span>
       </div>
@@ -2512,6 +2512,7 @@ HTML = r"""<!DOCTYPE html>
             <button type="button" id="quality-src-cpa" aria-pressed="true" onclick="setQualitySource('cpa')">CPA auth</button>
             <button type="button" id="quality-src-g2a" aria-pressed="false" onclick="setQualitySource('g2a')">Grok2API</button>
             <button type="button" id="quality-src-all" aria-pressed="false" onclick="setQualitySource('all')">全部 auth</button>
+            <button type="button" id="quality-src-accounts" aria-pressed="false" onclick="setQualitySource('accounts')">账号文件</button>
           </div>
           <div class="sso-settings" style="margin-top:10px">
             <div class="field">
@@ -2531,7 +2532,7 @@ HTML = r"""<!DOCTYPE html>
               <input type="number" id="quality-limit" min="0" max="2000" value="200"/>
             </div>
           </div>
-          <p class="sso-format" id="quality-source-hint">扫描 cpa_auth，默认测最近 200 条。点「开始测试」后看本页提示和进度，不要填 0 指望一次扫完全库。</p>
+          <p class="sso-format" id="quality-source-hint">扫描 cpa_auth，默认测最近 200 条。点「开始测试」后看本页提示和进度，不要填 0 指望一次扫完全库。选「账号文件」只读顶层 accounts/*.txt，不含子目录。</p>
         </div>
         <div class="button-group">
           <button class="primary" id="quality-start" onclick="startQualityScan()">开始测试</button>
@@ -2559,7 +2560,7 @@ HTML = r"""<!DOCTYPE html>
         <div class="sso-table-wrap">
           <table class="sso-table">
             <thead><tr><th>邮箱</th><th>判定</th><th>TPS</th><th>thinking</th><th>tokens</th><th>耗时</th><th>说明</th></tr></thead>
-            <tbody id="quality-body"><tr><td colspan="7" class="sso-empty">选择 auth 目录后开始测试</td></tr></tbody>
+            <tbody id="quality-body"><tr><td colspan="7" class="sso-empty">选择 CPA / Grok2API / 账号文件后开始测试</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -3821,9 +3822,9 @@ async function exportSsoState(kind) {
   } catch (e) { setMsg("sso-msg", String(e.message || e), "err"); }
 }
 function setQualitySource(source) {
-  if (!["cpa", "g2a", "all"].includes(source)) return;
+  if (!["cpa", "g2a", "all", "accounts"].includes(source)) return;
   qualitySource = source;
-  ["cpa", "g2a", "all"].forEach(name => {
+  ["cpa", "g2a", "all", "accounts"].forEach(name => {
     const btn = document.getElementById("quality-src-" + name);
     if (btn) btn.setAttribute("aria-pressed", String(name === source));
   });
@@ -3833,6 +3834,7 @@ function setQualitySource(source) {
     cpa: "扫描 cpa_auth（" + (counts.cpa ?? 0) + "）。请求走家宽，让账号真正生成一段回复后再判定。",
     g2a: "扫描 grok2api_auth（" + (counts.g2a ?? 0) + "）。",
     all: "扫描 CPA + Grok2API auth（" + (counts.all ?? 0) + "）。",
+    accounts: "只扫描顶层 accounts/*.txt（" + (counts.accounts ?? 0) + "），不含 old/ 等子目录。格式 email----sso 或纯 SSO；先换 token 再短测，不写入 CPA。跳过 mail_credentials / 风控隔离文件。",
   };
   if (hint) hint.textContent = labels[source] || labels.cpa;
 }

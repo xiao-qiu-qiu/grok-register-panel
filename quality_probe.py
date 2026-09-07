@@ -24,7 +24,14 @@ from typing import Callable
 
 from curl_cffi import requests
 from secure_files import append_private_text, ensure_private_dir
-from sso_to_auth_json import CPA_GROK_BASE_URL, CPA_GROK_HEADERS, CPA_PROBE_MODEL
+from sso_to_auth_json import (
+    CPA_GROK_BASE_URL,
+    CPA_GROK_HEADERS,
+    CPA_PROBE_MODEL,
+    parse_sso_line,
+    sso_to_token,
+    token_to_cpa_record,
+)
 from webui.security_utils import mask_email, redact_log_line, redact_proxy
 
 DEFAULT_PROMPT = (
@@ -245,6 +252,61 @@ def _auth_headers(record: dict) -> dict:
     return headers
 
 
+def convert_account_sso_to_auth(
+    sso: str,
+    *,
+    email: str = "",
+    proxy: str = "",
+    log=None,
+) -> dict | None:
+    """SSO cookie → in-memory CPA-shaped auth. Does not write files."""
+    quiet = log or (lambda *_args, **_kwargs: None)
+    token = sso_to_token(sso, proxy=proxy, log=quiet)
+    if not token or not str(token.get("access_token") or "").strip():
+        return None
+    return token_to_cpa_record(token, email=email, sso="", check_bfs=False)
+
+
+def _ensure_access_token(
+    record: dict,
+    proxy: str = "",
+    *,
+    convert_sso_fn: Callable | None = None,
+) -> str:
+    access = str(record.get("access_token") or record.get("key") or "").strip()
+    if access:
+        return access
+    sso = str(record.get("sso") or "").strip()
+    if not sso:
+        return ""
+    converter = convert_sso_fn or convert_account_sso_to_auth
+    try:
+        converted = converter(
+            sso,
+            email=str(record.get("email") or ""),
+            proxy=proxy,
+            log=lambda *_args, **_kwargs: None,
+        )
+    except TypeError:
+        converted = converter(sso)
+    except Exception:
+        converted = None
+    if not isinstance(converted, dict):
+        record.pop("sso", None)
+        return ""
+    access = str(converted.get("access_token") or converted.get("key") or "").strip()
+    if access:
+        record["access_token"] = access
+        if converted.get("email") and not record.get("email"):
+            record["email"] = converted["email"]
+        if converted.get("base_url"):
+            record["base_url"] = converted["base_url"]
+        if converted.get("headers"):
+            record["headers"] = converted["headers"]
+    record.pop("sso", None)
+    return access
+
+
 def probe_account(
     record: dict,
     proxy: str = "",
@@ -263,11 +325,13 @@ def probe_account(
     early_stop_ms: int = EARLY_STOP_MS,
     post_fn: Callable | None = None,
     monotonic: Callable[[], float] | None = None,
+    convert_sso_fn: Callable | None = None,
 ) -> dict:
     """Send one streamed chat completion and classify the account."""
     clock = monotonic or time.monotonic
+    had_sso = bool(str(record.get("sso") or "").strip())
+    access = _ensure_access_token(record, proxy, convert_sso_fn=convert_sso_fn)
     email = str(record.get("email") or "").strip()
-    access = str(record.get("access_token") or record.get("key") or "").strip()
     result = {
         "email": email,
         "verdict": "error",
@@ -287,9 +351,9 @@ def probe_account(
         "early_stop": False,
     }
     if not access:
-        result["error"] = "missing access_token"
+        result["error"] = "SSO 换 token 失败" if had_sso else "missing access_token"
         result["error_kind"] = "account_error"
-        result["verdict"] = "risk"
+        result["verdict"] = "error" if had_sso else "risk"
         return result
 
     payload = {
@@ -531,6 +595,60 @@ def load_auth_records(dirs: list[Path], *, limit: int = 0) -> list[dict]:
     return records
 
 
+ACCOUNT_SKIP_NAMES = {
+    "mail_credentials.txt",
+    "sso_risk_rejected.txt",
+    "sso_bfs_flagged.txt",
+}
+
+
+def load_account_records(dirs: list[Path], *, limit: int = 0) -> list[dict]:
+    """Load SSO rows from top-level accounts/*.txt only. Newest files first."""
+    records: list[dict] = []
+    seen: set[str] = set()
+    files: list[Path] = []
+    for folder in dirs:
+        if not folder or not folder.is_dir():
+            continue
+        try:
+            candidates = list(folder.glob("*.txt"))
+        except OSError:
+            continue
+        for path in candidates:
+            if path.name in ACCOUNT_SKIP_NAMES:
+                continue
+            files.append(path)
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    files.sort(key=_mtime, reverse=True)
+    for path in files:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            parsed = parse_sso_line(line, source=str(path))
+            if parsed is None or parsed.sso in seen:
+                continue
+            seen.add(parsed.sso)
+            records.append(
+                {
+                    "email": parsed.email,
+                    "sso": parsed.sso,
+                    "_path": str(path),
+                    "_file": path.name,
+                    "_source": "accounts",
+                }
+            )
+            if limit and len(records) >= limit:
+                return records
+    return records
+
+
 def public_row(row: dict) -> dict:
     return {
         "index": int(row.get("index") or 0),
@@ -577,6 +695,7 @@ def run_quality_scan(
     cancel_callback=None,
     post_fn: Callable | None = None,
     monotonic: Callable[[], float] | None = None,
+    convert_sso_fn: Callable | None = None,
 ) -> dict:
     """Probe many accounts. Export files are redacted jsonl (no tokens)."""
     pool = [str(item or "").strip() for item in (proxies or [])]
@@ -638,6 +757,7 @@ def run_quality_scan(
             early_stop_ms=early_stop_ms,
             post_fn=post_fn,
             monotonic=monotonic,
+            convert_sso_fn=convert_sso_fn,
         )
         row = {
             "index": index,

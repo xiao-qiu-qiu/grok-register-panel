@@ -192,10 +192,12 @@ def test_quality_probe_panel_structure():
     html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
     assert 'id="quality-view-toggle"' in html
     assert 'id="quality-view"' in html
+    assert 'id="quality-src-accounts"' in html
     assert 'id="quality-body"' in html
     assert 'id="quality-dash-title"' in html
     assert 'function toggleQualityView()' in mon
     assert 'function startQualityScan()' in mon
+    assert 'setQualitySource(\'accounts\')' in html or 'setQualitySource("accounts")' in html
     assert 'function refreshQuality(' in mon
     assert '/api/quality/start' in mon
     assert 'view !== "quality"' in mon

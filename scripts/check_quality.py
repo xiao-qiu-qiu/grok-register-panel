@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 
 from quality_probe import (  # noqa: E402
     DEFAULT_WORKERS,
+    load_account_records,
     load_auth_records,
     run_quality_scan,
 )
@@ -31,6 +32,11 @@ def main() -> int:
         description="Probe CPA/Grok2API accounts with a real streamed reply (家宽)"
     )
     ap.add_argument("--dir", action="append", default=[], help="auth directory (repeatable)")
+    ap.add_argument(
+        "--accounts",
+        action="store_true",
+        help="scan accounts/*.txt (SSO → token, then probe; does not write CPA)",
+    )
     ap.add_argument("--from-config", metavar="FILE", help="read proxy / auth dirs from config.json")
     ap.add_argument("--proxy", default="", help="explicit HTTP/SOCKS proxy; empty = 家宽池")
     ap.add_argument("--no-home", action="store_true", help="do not prefer 家宽 ports")
@@ -65,12 +71,25 @@ def main() -> int:
         if not path.is_absolute():
             path = ROOT / path
         dirs.append(path)
-    if not dirs:
-        dirs = [ROOT / "cpa_auth"]
-
-    records = load_auth_records(dirs, limit=max(0, int(args.limit or 0)))
-    if not records:
-        ap.error("没有可用的 auth 记录")
+    if args.accounts:
+        account_dir = ROOT / "accounts"
+        if args.from_config:
+            raw = str(cfg.get("accounts_dir") or "").strip()
+            if raw:
+                account_dir = Path(raw)
+                if not account_dir.is_absolute():
+                    account_dir = cfg_path.parent / account_dir
+        records = load_account_records(
+            [account_dir], limit=max(0, int(args.limit or 0))
+        )
+        if not records:
+            ap.error("accounts/ 里没有可解析的账号")
+    else:
+        if not dirs:
+            dirs = [ROOT / "cpa_auth"]
+        records = load_auth_records(dirs, limit=max(0, int(args.limit or 0)))
+        if not records:
+            ap.error("没有可用的 auth 记录")
 
     proxies = resolve_probe_proxies(args.proxy, prefer_home=not args.no_home)
     summary = run_quality_scan(

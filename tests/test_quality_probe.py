@@ -14,6 +14,7 @@ from quality_probe import (
     apply_quality_fields,
     classify_failure_kind,
     classify_sample,
+    load_account_records,
     load_auth_records,
     parse_sse_quality,
     probe_account,
@@ -286,6 +287,7 @@ def test_load_auth_records_and_quality_ops_status(tmp_path, monkeypatch=None):
     previous = (
         quality_ops.CPA_DIR,
         quality_ops.G2A_DIR,
+        quality_ops.ACCOUNTS_DIR,
         quality_ops.CONFIG_FILE,
         quality_ops.LOG_DIR,
         quality_ops.REPORT_FILE,
@@ -294,6 +296,7 @@ def test_load_auth_records_and_quality_ops_status(tmp_path, monkeypatch=None):
     )
     quality_ops.CPA_DIR = folder
     quality_ops.G2A_DIR = folder / "missing"
+    quality_ops.ACCOUNTS_DIR = folder / "accounts-missing"
     quality_ops.CONFIG_FILE = folder / "config.json"
     quality_ops.LOG_DIR = folder / "log"
     quality_ops.REPORT_FILE = quality_ops.LOG_DIR / "quality_scan_report.json"
@@ -304,17 +307,159 @@ def test_load_auth_records_and_quality_ops_status(tmp_path, monkeypatch=None):
         status = quality_ops.quality_status()
         assert status["ok"] is True
         assert status["sources"]["cpa"] == 1
+        assert status["sources"]["accounts"] == 0
         assert "secret-token" not in json.dumps(status)
     finally:
         (
             quality_ops.CPA_DIR,
             quality_ops.G2A_DIR,
+            quality_ops.ACCOUNTS_DIR,
             quality_ops.CONFIG_FILE,
             quality_ops.LOG_DIR,
             quality_ops.REPORT_FILE,
             quality_ops.DEGRADED_EXPORT,
             quality_ops.RISK_EXPORT,
         ) = previous
+
+
+def test_load_account_records_parses_sso_and_skips_sidecar_files():
+    token_a = "a" * 80
+    token_b = "b" * 80
+    token_c = "c" * 80
+    with tempfile.TemporaryDirectory() as temp:
+        folder = Path(temp)
+        (folder / "person@example.test.txt").write_text(
+            f"person@example.test----pass123----{token_a}\n",
+            encoding="utf-8",
+        )
+        (folder / "sso_pending.txt").write_text(
+            f"queued@example.test----{token_b}\n",
+            encoding="utf-8",
+        )
+        (folder / "mail_credentials.txt").write_text(
+            f"secret@example.test----pass----{token_a}\n",
+            encoding="utf-8",
+        )
+        (folder / "sso_risk_rejected.txt").write_text(
+            f"risk@example.test----{token_b}----botFlagSource=1\n",
+            encoding="utf-8",
+        )
+        nested = folder / "old"
+        nested.mkdir()
+        (nested / "nested@example.test.txt").write_text(
+            f"nested@example.test----{token_c}\n",
+            encoding="utf-8",
+        )
+        loaded = load_account_records([folder])
+        emails = {item["email"] for item in loaded}
+        assert emails == {"person@example.test", "queued@example.test"}
+        assert "nested@example.test" not in emails
+        assert all(item["_source"] == "accounts" for item in loaded)
+        dumped = json.dumps(loaded)
+        assert "pass123" not in dumped
+        row = public_row({"email": loaded[0]["email"], "sso": token_a, "verdict": "healthy"})
+        assert "sso" not in row
+        assert token_a not in json.dumps(row)
+
+
+def test_probe_account_converts_accounts_sso_then_chats():
+    token = "s" * 80
+    record = {
+        "email": "acct@example.test",
+        "sso": token,
+        "_file": "acct@example.test.txt",
+        "_source": "accounts",
+    }
+
+    def convert(sso, email="", proxy="", log=None):
+        assert sso == token
+        assert email == "acct@example.test"
+        return {"access_token": "converted-access-token", "email": email}
+
+    def post(_url, **kwargs):
+        assert "converted-access-token" in kwargs["headers"]["Authorization"]
+        return FakeResp(
+            200,
+            sse(
+                {"choices": [{"delta": {"thinking_content": "plan"}}]},
+                {"choices": [{"delta": {"content": "A" * 80}}]},
+            ),
+        )
+
+    probed = probe_account(
+        record,
+        proxy="http://127.0.0.1:8001",
+        post_fn=post,
+        convert_sso_fn=convert,
+        monotonic=lambda: 1.0,
+        early_stop_on_thinking=True,
+        early_stop_ms=0,
+    )
+    assert probed["verdict"] == "healthy"
+    assert record.get("sso") in (None, "")
+    assert record["access_token"] == "converted-access-token"
+
+    failed = probe_account(
+        {"email": "dead@example.test", "sso": token, "_source": "accounts"},
+        convert_sso_fn=lambda *_a, **_k: None,
+        monotonic=lambda: 1.0,
+    )
+    assert failed["verdict"] == "error"
+    assert "SSO" in failed["error"]
+
+
+def test_quality_ops_accounts_source_counts_and_start_error():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        accounts = root / "accounts"
+        accounts.mkdir()
+        (accounts / "ok@example.test.txt").write_text(
+            "ok@example.test----" + ("c" * 80) + "\n",
+            encoding="utf-8",
+        )
+        previous = (
+            quality_ops.CPA_DIR,
+            quality_ops.G2A_DIR,
+            quality_ops.ACCOUNTS_DIR,
+            quality_ops.CONFIG_FILE,
+            quality_ops.LOG_DIR,
+            quality_ops.REPORT_FILE,
+            quality_ops.DEGRADED_EXPORT,
+            quality_ops.RISK_EXPORT,
+        )
+        quality_ops.CPA_DIR = root / "cpa"
+        quality_ops.G2A_DIR = root / "g2a"
+        quality_ops.ACCOUNTS_DIR = accounts
+        quality_ops.CONFIG_FILE = root / "config.json"
+        quality_ops.LOG_DIR = root / "log"
+        quality_ops.REPORT_FILE = quality_ops.LOG_DIR / "quality_scan_report.json"
+        quality_ops.DEGRADED_EXPORT = quality_ops.LOG_DIR / "quality_degraded.jsonl"
+        quality_ops.RISK_EXPORT = quality_ops.LOG_DIR / "quality_risk.jsonl"
+        quality_ops.LOG_DIR.mkdir()
+        try:
+            status = quality_ops.quality_status()
+            assert status["sources"]["accounts"] == 1
+            assert "c" * 80 not in json.dumps(status)
+            empty_dir = root / "empty-accounts"
+            empty_dir.mkdir()
+            quality_ops.ACCOUNTS_DIR = empty_dir
+            missing = quality_ops.start_quality_scan(source="accounts")
+            assert missing.get("ok") is False
+            assert "accounts/" in str(missing.get("error") or "")
+            unknown = quality_ops.start_quality_scan(source="nope")
+            assert unknown.get("ok") is False
+        finally:
+            (
+                quality_ops.CPA_DIR,
+                quality_ops.G2A_DIR,
+                quality_ops.ACCOUNTS_DIR,
+                quality_ops.CONFIG_FILE,
+                quality_ops.LOG_DIR,
+                quality_ops.REPORT_FILE,
+                quality_ops.DEGRADED_EXPORT,
+                quality_ops.RISK_EXPORT,
+            ) = previous
+            quality_ops.stop_quality_scan()
 
 
 if __name__ == "__main__":
@@ -326,6 +471,9 @@ if __name__ == "__main__":
     test_probe_account_early_stops_after_thinking()
     test_stamp_quality_on_record_writes_meta_not_token()
     test_run_quality_scan_exports_redacted_jsonl()
+    test_load_account_records_parses_sso_and_skips_sidecar_files()
+    test_probe_account_converts_accounts_sso_then_chats()
     with tempfile.TemporaryDirectory() as temp:
         test_load_auth_records_and_quality_ops_status(Path(temp))
+    test_quality_ops_accounts_source_counts_and_start_error()
     print("OK quality probe")

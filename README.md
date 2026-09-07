@@ -401,9 +401,9 @@ SSO 读 grok.com `botFlagSource` **已经不能判断风控**。改用 CPA / Gro
 | 能力 | 说明 |
 |------|------|
 | 注册时 | 开关打开后写入 auth 才短测，`quality_verdict` 写进 json |
-| 面板 | 顶部「降智测试」：复测存量 `cpa_auth` / `grok2api_auth`，默认走家宽池 |
+| 面板 | 顶部「降智测试」：复测存量 `cpa_auth` / `grok2api_auth`，或导入 `accounts/*.txt`（先换 token 再测，不写 CPA），默认走家宽池 |
 | 导出 | 脱敏 JSONL，不含 token：`log/quality_degraded.jsonl`、`log/quality_risk.jsonl` |
-| CLI | `python scripts/check_quality.py --dir cpa_auth --from-config config.json` |
+| CLI | `python scripts/check_quality.py --dir cpa_auth --from-config config.json`；测账号文件用 `--accounts` |
 
 ```bash
 python scripts/check_quality.py --dir cpa_auth --from-config config.json \
