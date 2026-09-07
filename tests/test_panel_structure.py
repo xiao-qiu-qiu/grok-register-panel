@@ -65,6 +65,20 @@ def test_reference_motion_and_reduced_motion():
     assert '@media (prefers-reduced-motion: reduce)' in mon
     assert 'animation-iteration-count: 1 !important;' in mon
 
+def test_proxy_exit_refresh_and_unused_email_fail_kpi():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert 'id="proxy-refresh-exit"' in html
+    assert html.index('id="proxy-refresh-exit"') < html.index('id="proxy-test-all"')
+    assert 'onclick="toggleProxyExitRefresh()"' in html
+    assert 'aria-pressed="false"' in html
+    assert '/api/proxies/refresh-exit-ip' in mon
+    assert 'function toggleProxyExitRefresh(' in mon
+    assert 'loadProxies' not in mon
+    assert '["未耗邮箱"' in mon
+    assert 'fail_no_email' in mon
+
+
 def test_compact_overview_density():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
     assert '.page-heading > div { min-width: 0; }' in mon
@@ -290,6 +304,7 @@ if __name__ == '__main__':
     test_theme_switch_structure()
     test_reference_design_tokens_and_fonts()
     test_reference_motion_and_reduced_motion()
+    test_proxy_exit_refresh_and_unused_email_fail_kpi()
     test_compact_overview_density()
     test_help_and_faq_module()
     test_sso_state_panel_structure()

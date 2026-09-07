@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Changed
+
+- Write Grok2API SSO to a single `sso.txt` under `grok2api_auth_dir` (one SSO per line, de-duplicated) instead of one `g2a-<email>.json` per account.
+
+### Fixed
+
+- Rotate off a node after an unreadable grok.com risk page, and every 300s re-probe exit IPs so a dynamic node is released from risk/cooldown when its IP changes.
+- Show a yellow unused-mailbox fail count next to batch failures, and put a 300s exit-IP refresh control beside the proxy-pool “检测全部” button.
+- Stop the proxy-pool “正在刷新出口 IP…” status from hanging: parallel IP probes, per-node timeout, and progress polling after the refresh button.
+- Make “300s 刷新节点” a toggle that fires immediately then repeats on a countdown; when the exit IP changes it only clears `last_error`, not cooldown.
+- Stop `/api/stats` from 500ing on Windows once the batch log exceeds 400KB (`grep` is not available).
+- Persist the Windows panel `MONITOR_TOKEN` in `.env.monitor` so each restart does not mint a new token and trip the browser localStorage mismatch.
+
 ## 0.5.0 - 2026-09-06
 
 ### Added

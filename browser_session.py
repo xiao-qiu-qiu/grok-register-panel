@@ -680,13 +680,20 @@ def _resolve_proxy_exit_ip(proxy_str: str, timeout: float = 8.0, log_callback=No
 
 
 def _build_camoufox_proxy(proxy_str: str) -> dict:
-    """把 http://host:port 格式的代理 URL 转换为 Camoufox/Playwright proxy dict。"""
+    """把代理 URL 转换为 Camoufox/Playwright proxy dict。
+
+    Playwright accepts ``socks5`` for SOCKS5 proxies, but ``socks5h`` is a
+    curl/requests spelling. Passing the latter through makes Firefox reset the
+    navigation before reaching the target page, so normalize it only at the
+    browser boundary and keep the upstream URL unchanged elsewhere.
+    """
     proxy_str = proxy_str.strip()
     if not proxy_str:
         return {}
     parsed = urlparse(proxy_str)
     if parsed.scheme and parsed.hostname:
-        server = f"{parsed.scheme}://{parsed.hostname}"
+        scheme = "socks5" if parsed.scheme.lower() == "socks5h" else parsed.scheme
+        server = f"{scheme}://{parsed.hostname}"
         if parsed.port:
             server += f":{parsed.port}"
     else:

@@ -39,6 +39,8 @@ try:
         import_proxies,
         read_proxy_pool,
         start_proxy_tests,
+        start_exit_ip_refresh,
+        set_exit_ip_refresh_enabled,
         update_proxy,
     )
     from webui.email_domain_store import (
@@ -88,6 +90,8 @@ except ImportError:  # running as script from webui/
         import_proxies,
         read_proxy_pool,
         start_proxy_tests,
+        start_exit_ip_refresh,
+        set_exit_ip_refresh_enabled,
         update_proxy,
     )
     from email_domain_store import (  # type: ignore
@@ -210,6 +214,9 @@ RE_WORKER = re.compile(r"\[W(\d+)\]")
 RE_BATCH = re.compile(r"\[batch\] count=(\d+) workers=(\d+)")
 RE_START = re.compile(r"终端模式启动，目标数量:\s*(\d+)\s*\|\s*并发:\s*(\d+)")
 RE_END = re.compile(r"任务结束。成功\s*(\d+)\s*\|\s*失败\s*(\d+)")
+RE_RESULT = re.compile(r"\[结果\] status=(\S+)")
+RE_RESULT_EMAIL_USED = re.compile(r"email_used=([01])")
+RE_RESULT_EMAIL = re.compile(r"\bemail=(\S+)")
 RE_ADDED_BL = re.compile(r"ADDED blacklist AS(\d+)")
 RE_LOOKUP_FAIL = re.compile(r"lookup fail", re.I)
 RE_ANALYZE_ERR = re.compile(r"analyze error", re.I)
@@ -360,7 +367,7 @@ def parse_log(path, max_tail=400_000):
         text = f.read().decode("utf-8", errors="replace")
 
     lines = text.splitlines()
-    ok = fail = domain = skip = bot0 = bot1 = bfs_hits = 0
+    ok = fail = fail_no_email = domain = skip = bot0 = bot1 = bfs_hits = 0
     count = workers = None
     ended = None
     recent_ok = []
@@ -411,21 +418,44 @@ def parse_log(path, max_tail=400_000):
             bot1 += 1
         if RE_BFS.search(line):
             bfs_hits += 1
+        rm = RE_RESULT.search(line)
+        if rm:
+            status = rm.group(1)
+            if status and status != "ok":
+                used = None
+                um = RE_RESULT_EMAIL_USED.search(line)
+                if um:
+                    used = um.group(1) == "1"
+                else:
+                    em = RE_RESULT_EMAIL.search(line)
+                    used = bool(em and em.group(1) not in ("-", "", "None", "none"))
+                if not used:
+                    fail_no_email += 1
 
     last_lines = lines[-40:]
     if size > max_tail:
         def gcount(pat):
-            r = subprocess.run(["grep", "-c", pat, str(path)], capture_output=True, text=True)
             try:
-                return int(r.stdout.strip() or 0)
+                r = subprocess.run(
+                    ["grep", "-c", pat, str(path)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except OSError:
+                return None
+            try:
+                return int((r.stdout or "").strip() or 0)
             except Exception:
                 return 0
 
-        ok = gcount("注册成功")
-        fail = gcount(r"\[-\] 失败")
-        bot0 = gcount("botFlagSource=0")
-        bot1 = gcount("botFlagSource=1")
-        bfs_hits = gcount("JWT bfs 标记") + gcount("bfs_flagged")
+        full_ok = gcount("注册成功")
+        if full_ok is not None:
+            ok = full_ok
+            fail = gcount(r"\[-\] 失败") or 0
+            bot0 = gcount("botFlagSource=0") or 0
+            bot1 = gcount("botFlagSource=1") or 0
+            bfs_hits = (gcount("JWT bfs 标记") or 0) + (gcount("bfs_flagged") or 0)
 
     return {
         "log": path.name,
@@ -436,6 +466,7 @@ def parse_log(path, max_tail=400_000):
         "workers": workers,
         "ok": ok,
         "fail": fail,
+        "fail_no_email": fail_no_email,
         "domain": domain,
         "skip": skip,
         "bot0": bot0,
@@ -642,6 +673,7 @@ def success_stats():
         "jsonl_fail": jsonl_fail,
         "batch_ok": batch_ok,
         "batch_fail": batch_fail,
+        "fail_no_email": parsed.get("fail_no_email") or 0,
         "batch_log": parsed.get("log_name"),
         "by_day": by_day,
         "rates": rates,
@@ -1404,6 +1436,11 @@ HTML = r"""<!DOCTYPE html>
   .proxy-list-section { margin-top: 18px; }
   .proxy-list-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
   .proxy-list-head h2 { margin: 0; font-size: 13px; }
+  .proxy-list-actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+  #proxy-refresh-exit[aria-pressed="true"] {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
   .proxy-table-wrap { overflow: auto; border: 1px solid var(--border); background: var(--surface-raised); }
   .proxy-table { min-width: 990px; table-layout: fixed; }
   .proxy-table th:nth-child(1) { width: 82px; }
@@ -1913,6 +1950,8 @@ HTML = r"""<!DOCTYPE html>
     .proxy-import-actions .button-group { justify-content: stretch; }
     .proxy-import-actions button { flex: 1 1 auto; }
     .proxy-list-head { align-items: flex-start; flex-direction: column; }
+    .proxy-list-actions { width: 100%; }
+    .proxy-list-actions button { flex: 1 1 auto; }
     .domain-view { inset-block-start: 60px; }
     .domain-view-inner { width: calc(100% - 24px); padding: 20px 0 34px; }
     .domain-view-heading { align-items: flex-start; flex-direction: column; margin-bottom: 16px; padding-bottom: 16px; }
@@ -2135,7 +2174,7 @@ HTML = r"""<!DOCTYPE html>
         <div class="faq-grid" id="faq-grid">
           <details class="faq-item" data-faq-item data-search="令牌 token unauthorized 401 保存设置 启动">
             <summary>提示访问令牌不匹配或 401</summary>
-            <div class="faq-answer">重新输入当前面板令牌并保存。令牌只保存在当前浏览器的 localStorage 中，换端口、设备或浏览器后需要重新输入。</div>
+            <div class="faq-answer">把启动窗口打印的 token= 值贴进「访问令牌」。浏览器只把令牌存在 localStorage，和服务器环境变量 MONITOR_TOKEN 必须相同。Windows 面板脚本会把令牌写入 .env.monitor，重启后应保持不变；若仍不匹配，以本次启动窗口打印的值为准，不要用上次记住的旧串。</div>
           </details>
           <details class="faq-item" data-faq-item data-search="启动 立即结束 目标 cpa add_count 追加目标">
             <summary>点击启动后立即结束</summary>
@@ -2243,7 +2282,10 @@ HTML = r"""<!DOCTYPE html>
             <h2>代理明细</h2>
             <div class="proxy-job mono" id="proxy-test-status" role="status" aria-live="polite">未开始检测</div>
           </div>
-          <button id="proxy-test-all" onclick="testProxies()">检测全部</button>
+          <div class="proxy-list-actions">
+            <button id="proxy-refresh-exit" aria-pressed="false" onclick="toggleProxyExitRefresh()">300s 刷新节点</button>
+            <button id="proxy-test-all" onclick="testProxies()">检测全部</button>
+          </div>
         </div>
         <div class="proxy-table-wrap">
           <table class="proxy-table">
@@ -3000,9 +3042,27 @@ function renderProxyPool(data) {
   const job = proxyData.test_job || {};
   const testButton = document.getElementById("proxy-test-all");
   testButton.disabled = !!job.running || !(summary.enabled > 0);
-  document.getElementById("proxy-test-status").textContent = job.running
+  const refreshJob = proxyData.exit_ip_refresh || {};
+  syncExitRefreshButton(refreshJob);
+  let testStatus = job.running
     ? ("检测中 " + (job.completed || 0) + "/" + (job.total || 0) + "，健康 " + (job.healthy || 0) + "，失败 " + (job.failed || 0))
     : (job.finished_at ? ("上次检测：健康 " + (job.healthy || 0) + "，失败 " + (job.failed || 0)) : "未开始检测");
+  if (refreshJob.running) {
+    testStatus = "正在刷新出口 IP " + (refreshJob.checked || 0) + "/" + (refreshJob.total || 0) + "…";
+  } else if (refreshJob.loop_enabled) {
+    const refreshNote = refreshJob.error
+      ? ("出口 IP 刷新失败：" + refreshJob.error)
+      : (refreshJob.finished_at
+        ? ("出口 IP 变化 " + (refreshJob.changed || 0) + "，清风控 " + (refreshJob.cleared || 0) + "，失败 " + (refreshJob.failed || 0))
+        : "已开启 300s 自动刷新");
+    testStatus += " / " + refreshNote;
+  } else if (refreshJob.finished_at) {
+    const refreshNote = refreshJob.error
+      ? ("出口 IP 刷新失败：" + refreshJob.error)
+      : ("出口 IP 变化 " + (refreshJob.changed || 0) + "，清风控 " + (refreshJob.cleared || 0) + "，失败 " + (refreshJob.failed || 0));
+    testStatus += " / " + refreshNote;
+  }
+  document.getElementById("proxy-test-status").textContent = testStatus;
 
   const items = proxyData.items || [];
   document.getElementById("proxy-body").innerHTML = items.length ? items.map(item => {
@@ -3076,6 +3136,78 @@ async function importLegacyProxies() {
     setTimeout(() => refreshProxies(false), 300);
   } catch (e) { setMsg("proxy-msg", String(e.message || e), "err"); }
   button.disabled = false;
+}
+function exitRefreshButtonLabel(job) {
+  job = job || {};
+  if (job.running) {
+    return "刷新中 " + (job.checked || 0) + "/" + (job.total || 0);
+  }
+  if (!job.loop_enabled) return "300s 刷新节点";
+  const next = Date.parse(job.next_at || "");
+  if (!Number.isFinite(next)) return "300s 自动刷新中";
+  const sec = Math.max(0, Math.round((next - Date.now()) / 1000));
+  const minutes = Math.floor(sec / 60);
+  const seconds = String(sec % 60).padStart(2, "0");
+  return minutes + ":" + seconds + " 后刷新";
+}
+function syncExitRefreshButton(job) {
+  job = job || (proxyData && proxyData.exit_ip_refresh) || {};
+  const button = document.getElementById("proxy-refresh-exit");
+  if (!button) return;
+  button.textContent = exitRefreshButtonLabel(job);
+  button.setAttribute("aria-pressed", job.loop_enabled ? "true" : "false");
+  if (job.loop_enabled) {
+    if (!window._exitRefreshTick) {
+      window._exitRefreshTick = setInterval(() => {
+        const current = (proxyData && proxyData.exit_ip_refresh) || {};
+        const btn = document.getElementById("proxy-refresh-exit");
+        if (btn) btn.textContent = exitRefreshButtonLabel(current);
+      }, 1000);
+    }
+  } else if (window._exitRefreshTick) {
+    clearInterval(window._exitRefreshTick);
+    window._exitRefreshTick = 0;
+  }
+}
+async function toggleProxyExitRefresh() {
+  const job = (proxyData && proxyData.exit_ip_refresh) || {};
+  const enable = !job.loop_enabled;
+  setMsg("proxy-msg", enable ? "正在开启 300s 自动刷新…" : "正在关闭自动刷新…", "");
+  try {
+    await api("/api/proxies/refresh-exit-ip", {
+      method: "POST",
+      body: JSON.stringify({ enabled: enable }),
+      authHelp: true,
+    });
+    await refreshProxies(false);
+    if (!enable) {
+      setMsg("proxy-msg", "已关闭 300s 自动刷新", "ok");
+      return;
+    }
+    setMsg("proxy-msg", "已开启：立即刷新一次，之后每 300s 自动刷新", "ok");
+    const startedAt = Date.now();
+    const poll = async () => {
+      await refreshProxies(false);
+      const current = (proxyData && proxyData.exit_ip_refresh) || {};
+      if (current.running && Date.now() - startedAt < 90000) {
+        setTimeout(poll, 800);
+        return;
+      }
+      if (current.error) {
+        setMsg("proxy-msg", "出口 IP 刷新失败：" + current.error, "err");
+        return;
+      }
+      setMsg(
+        "proxy-msg",
+        "出口 IP 已刷新：变化 " + (current.changed || 0) + "，清风控 " + (current.cleared || 0) + "，失败 " + (current.failed || 0),
+        "ok"
+      );
+    };
+    setTimeout(poll, 800);
+  } catch (error) {
+    setMsg("proxy-msg", error.message || String(error), "err");
+    await refreshProxies(false);
+  }
 }
 async function testProxies(id) {
   const ids = id ? [id] : [];
@@ -3887,6 +4019,7 @@ function renderStats(s, opts) {
       base_cpa: s.base_cpa != null ? s.base_cpa : lastFullStats.base_cpa,
       batch_ok: s.batch_ok != null ? s.batch_ok : lastFullStats.batch_ok,
       batch_fail: s.batch_fail != null ? s.batch_fail : lastFullStats.batch_fail,
+      fail_no_email: s.fail_no_email != null ? s.fail_no_email : lastFullStats.fail_no_email,
       // rates 以快照里的为准（snapshot 已算），否则沿用缓存
       rates: (s.rates && Object.keys(s.rates).length) ? s.rates : lastFullStats.rates,
     });
@@ -3901,6 +4034,7 @@ function renderStats(s, opts) {
     ["CPA 变化", s.cpa_delta ?? "--", "ok"],
     ["本批成功", s.batch_ok ?? 0, "ok"],
     ["本批失败", s.batch_fail ?? 0, "fail"],
+    ["未耗邮箱", s.fail_no_email ?? 0, "warn"],
     ["jsonl ok", jsonlOk != null ? jsonlOk : "--", "ok"],
     ["jsonl risk", jsonlRisk != null ? jsonlRisk : "--", "warn"],
   ].map(([l,v,c]) => `<div class="chip"><span>${esc(l)}</span><b class="${c}">${esc(v)}</b></div>`).join("");
@@ -3962,6 +4096,7 @@ function render(d) {
   const kpis = [
     ["本批成功", d.ok ?? 0, "ok", "目标 " + (d.target ?? "--")],
     ["本批失败", d.fail ?? 0, "fail", d.success_rate != null ? "成功率 " + d.success_rate + "%" : "暂无数据"],
+    ["未耗邮箱", d.fail_no_email ?? 0, "warn", "失败但未记入库存"],
     ["CPA 总量", d.cpa ?? "--", "accent", "较基线 " + (d.cpa_delta != null ? ((Number(d.cpa_delta) >= 0 ? "+" : "") + d.cpa_delta) : "--")],
     ["正常 / 风控", (d.bot0 ?? 0) + " / " + (d.bot1 ?? 0), (d.bot1 ?? 0) > 0 ? "warn" : "ok", "注册结果采样"],
     ["BFS 标记", d.bfs ?? 0, (d.bfs ?? 0) > 0 ? "warn" : "ok", "JWT claim 命中"],
@@ -3993,6 +4128,7 @@ function render(d) {
     base_cpa: d.base_cpa,
     batch_ok: d.ok,
     batch_fail: d.fail,
+    fail_no_email: d.fail_no_email ?? 0,
     rates: d.rates || {},
   }, { liveMerge: true });
 
@@ -4428,6 +4564,14 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     result = import_proxies(body.get("proxies"), source="panel")
                 self._json(200 if result.get("ok") else 400, result)
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/proxies/refresh-exit-ip":
+            try:
+                result = set_exit_ip_refresh_enabled(body.get("enabled"))
+                code = 202 if result.get("ok") else 400
+                self._json(code, result)
             except Exception as e:
                 self._json(400, {"ok": False, "error": redact_log_line(str(e))})
             return

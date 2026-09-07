@@ -22,6 +22,7 @@ try:
         terminate_managed_processes,
         write_pid_file,
     )
+    from webui.proxy_store import worker_proxy_snapshot
 except ImportError:  # running from webui/
     from secure_files import best_effort_fchmod, ensure_private_dir, exclusive_file_lock
     from process_utils import (  # type: ignore
@@ -29,6 +30,7 @@ except ImportError:  # running from webui/
         terminate_managed_processes,
         write_pid_file,
     )
+    from proxy_store import worker_proxy_snapshot  # type: ignore
 
 ACCOUNTS_DIR = ROOT / "accounts"
 PENDING_FILE = ACCOUNTS_DIR / "sso_pending.txt"
@@ -147,6 +149,29 @@ def _read_report() -> dict:
     }
 
 
+def _recovery_child_env() -> dict[str, str]:
+    env = {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
+    try:
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        config = {}
+    if str(config.get("proxy") or "").strip():
+        return env
+
+    snapshot = worker_proxy_snapshot()
+    urls = list(snapshot.get("urls") or [])
+    if snapshot.get("configured") and not urls:
+        raise RuntimeError("代理池已配置，但没有已启用且健康的节点")
+    if urls:
+        env["GROK_RECOVERY_PROXY"] = str(urls[0])
+    return env
+
+
 def recovery_status() -> dict:
     pending = _records_from_file(PENDING_FILE)
     all_records = _account_records()
@@ -187,6 +212,10 @@ def start_recovery(scope: str = "pending") -> dict:
     count = status["pending_count"] if normalized_scope == "pending" else status["recoverable_count"]
     if count <= 0:
         return {"ok": False, "error": "no recoverable records", "status": status}
+    try:
+        child_env = _recovery_child_env()
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc), "status": status}
 
     ensure_private_dir(LOG_DIR)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
@@ -213,7 +242,7 @@ def start_recovery(scope: str = "pending") -> dict:
             cwd=str(ROOT),
             stdout=output,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env=child_env,
             **popen_group_kwargs(),
         )
     finally:

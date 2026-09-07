@@ -205,7 +205,7 @@ def test_cloudflare_combined_error_is_redacted():
     assert "person@example.com" not in redacted
 
 
-def test_mail_direct_uses_configured_provider_bases():
+def test_mail_direct_skips_cloudflare_but_keeps_other_provider_bases():
     keys = (
         "cloudflare_api_base",
         "cloudmail_url",
@@ -222,7 +222,7 @@ def test_mail_direct_uses_configured_provider_bases():
         }
     )
     try:
-        assert register._url_needs_direct(
+        assert not register._url_needs_direct(
             "https://cf-mail.example.test/api/new_address"
         )
         assert register._url_needs_direct(
@@ -243,5 +243,5 @@ if __name__ == "__main__":
     test_managed_domains_reach_all_supported_provider_adapters()
     test_managed_domain_is_passed_to_provider_and_blocks_without_fallback()
     test_cloudflare_combined_error_is_redacted()
-    test_mail_direct_uses_configured_provider_bases()
+    test_mail_direct_skips_cloudflare_but_keeps_other_provider_bases()
     print("OK email domain worker integration")

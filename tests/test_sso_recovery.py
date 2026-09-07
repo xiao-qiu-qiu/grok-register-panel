@@ -13,12 +13,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from sso_to_auth_json import (
+    GROK2API_SSO_FILENAME,
     apply_config_defaults,
     consume_successful_records,
     existing_cpa_emails,
     load_sso_records,
     parse_sso_line,
     should_create_default_out_dir,
+    write_grok2api_auth,
+    write_grok2api_raw_sso,
 )
 
 
@@ -133,6 +136,30 @@ def test_bfs_config_defaults_are_loaded_for_cli():
         assert args.grok2api_auth_dir == str((Path(temp) / "g2a").resolve())
 
 
+def test_grok2api_output_is_single_file_one_sso_per_line():
+    with tempfile.TemporaryDirectory() as temp:
+        auth_dir = Path(temp) / "g2a"
+        path = write_grok2api_auth(
+            auth_dir,
+            {"access_token": "access-token-placeholder"},
+            sso=f"sso={TOKEN_A}",
+            email="person@example.com",
+        )
+        same_path = write_grok2api_raw_sso(
+            auth_dir,
+            TOKEN_B,
+            email="other@example.com",
+        )
+        write_grok2api_raw_sso(auth_dir, f"sso={TOKEN_A}", email="person@example.com")
+
+        assert path == same_path
+        assert path.name == GROK2API_SSO_FILENAME
+        assert {p.name for p in auth_dir.glob("*.txt")} == {GROK2API_SSO_FILENAME}
+        assert path.read_bytes() == f"{TOKEN_A}\n{TOKEN_B}\n".encode("utf-8")
+        if os.name == "posix":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
 if __name__ == "__main__":
     test_parser_preserves_email_and_password()
     test_queue_dedup_and_consume()
@@ -140,4 +167,5 @@ if __name__ == "__main__":
     test_cpa_only_batch_does_not_create_auth_out()
     test_existing_cpa_email_detection()
     test_bfs_config_defaults_are_loaded_for_cli()
+    test_grok2api_output_is_single_file_one_sso_per_line()
     print("OK sso recovery")

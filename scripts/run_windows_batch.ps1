@@ -20,6 +20,7 @@ $env:PYTHONUTF8 = "1"
 if (-not $env:GROK_HEADLESS) { $env:GROK_HEADLESS = "1" }
 if (-not $env:GROK_USE_XVFB) { $env:GROK_USE_XVFB = "0" }
 if (-not $env:MONITOR_HOST) { $env:MONITOR_HOST = "127.0.0.1" }
+if (-not $env:PROXY_HOME_PORTS) { $env:PROXY_HOME_PORTS = ((17901..17950) -join ",") }
 
 & $venvPy -u (Join-Path $Root "run_batch_headless.py") $Count $Workers
 exit $LASTEXITCODE

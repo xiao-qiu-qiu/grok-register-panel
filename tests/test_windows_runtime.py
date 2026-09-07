@@ -39,6 +39,16 @@ def test_proxy_ip_validation_is_strict():
     assert browser_session._normalize_ip_candidate("not-an-ip") == ""
 
 
+def test_camoufox_proxy_normalizes_socks5h_scheme():
+    assert browser_session._build_camoufox_proxy(
+        "socks5h://user:pass@127.0.0.1:17901"
+    ) == {
+        "server": "socks5://127.0.0.1:17901",
+        "username": "user",
+        "password": "pass",
+    }
+
+
 def test_account_gap_sleep_is_cancelable():
     started = time.monotonic()
     grok_register_ttk._sleep_cancelable(2, lambda: True)
@@ -119,9 +129,19 @@ def test_windows_process_tree_terminates_descendants():
     assert "target=_read_pipe" in source
 
 
+def test_windows_panel_script_persists_monitor_token():
+    source = (ROOT / "scripts" / "run_windows_panel.ps1").read_text(encoding="utf-8")
+    assert ".env.monitor" in source
+    assert "Import-MonitorEnv" in source
+    assert "Save-MonitorToken" in source
+    assert "secrets.token_urlsafe(32)" in source
+
+
 if __name__ == "__main__":
     test_windows_profile_root_uses_local_app_data()
     test_proxy_ip_validation_is_strict()
+    test_camoufox_proxy_normalizes_socks5h_scheme()
     test_account_gap_sleep_is_cancelable()
     test_windows_process_tree_terminates_descendants()
+    test_windows_panel_script_persists_monitor_token()
     print("OK windows runtime")

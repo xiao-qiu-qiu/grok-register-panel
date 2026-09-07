@@ -25,6 +25,8 @@ powershell -ExecutionPolicy Bypass -File scripts\run_windows_panel.ps1
 - `PYTHONUTF8=1`
 - `GROK_USE_XVFB=0`
 
+面板令牌：启动脚本会把 `MONITOR_TOKEN` 写入项目根目录的 `.env.monitor`（已 gitignore），下次启动复用同一串。浏览器「访问令牌」必须与控制台打印的 `token=` 一致；换浏览器或清站点数据后重新粘贴一次即可。不要把 `.env.monitor` 提交进仓库。
+
 代理池在面板里导入，或写 `proxies.txt` / `config.json` 的 `proxy`。支持 `http://` 与 `socks5://`。
 不要沿用另一台机器上的 loopback 端口。
 

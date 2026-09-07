@@ -134,7 +134,8 @@ def test_http_connect_metering_and_private_state():
             assert "example-user" not in state_text
             assert "example-pass" not in state_text
             assert urlparse(meter).password not in state_text
-            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+            if os.name == "posix":
+                assert stat.S_IMODE(path.stat().st_mode) == 0o600
             assert all(b"Proxy-Authorization: Basic " in item for item in upstream.requests)
 
             assert finalized["running"] is False
@@ -176,7 +177,8 @@ def test_batch_history_is_private_idempotent_and_summarized():
         }
         assert batch_traffic.archive_batch(history_path, first)
         assert batch_traffic.archive_batch(history_path, first)
-        assert stat.S_IMODE(history_path.stat().st_mode) == 0o600
+        if os.name == "posix":
+            assert stat.S_IMODE(history_path.stat().st_mode) == 0o600
 
         second = {
             "batch_id": "batch-b",

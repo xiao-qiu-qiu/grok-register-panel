@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from email import policy
+from email.parser import Parser
+from html import unescape
 import re
 import random
 import string
@@ -57,6 +60,52 @@ def pick_list_payload(data: Any) -> List[dict]:
             if isinstance(nested.get("messages"), list):
                 return [item for item in nested["messages"] if isinstance(item, dict)]
     return []
+
+
+def decode_raw_message(raw: str) -> str:
+    """Decode an RFC 5322/MIME message into searchable text.
+
+    Cloudflare's mailbox API exposes the complete MIME message in ``raw``;
+    its transfer-encoded body is not searchable until the MIME layers are
+    decoded.  If the value is already plain text, the original value is kept.
+    """
+    source = str(raw or "")
+    if not source.strip():
+        return ""
+    try:
+        message = Parser(policy=policy.default).parsestr(source)
+        parts = message.walk() if message.is_multipart() else (message,)
+        decoded: list[str] = []
+        for part in parts:
+            if part.is_multipart() or part.get_content_disposition() == "attachment":
+                continue
+            if message.is_multipart() and part.get_content_type() not in {
+                "text/plain",
+                "text/html",
+            }:
+                continue
+            try:
+                content = part.get_content()
+            except Exception:
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                charset = part.get_content_charset() or "utf-8"
+                content = payload.decode(charset, errors="replace")
+            if isinstance(content, str) and content.strip():
+                if "<" in content and ">" in content:
+                    content = re.sub(
+                        r"(?is)<(style|script)\b[^>]*>.*?</\1>",
+                        " ",
+                        content,
+                    )
+                    content = unescape(re.sub(r"<[^>]+>", " ", content))
+                decoded.append(content)
+        if decoded:
+            return "\n".join(decoded)
+    except Exception:
+        pass
+    return source
 
 
 # xAI 邮件验证码：XXX-YYY（如 QO7-TUD / CXX-PC2 / XSB-802）
@@ -172,16 +221,33 @@ def extract_verification_code(text: str, subject: str = "") -> Optional[str]:
     )
     best = None
     best_score = -10**9
+    deferred_numeric: list[str] = []
     for m in _CODE_RE.finditer(hay):
         cand = m.group(1)
         if not _is_plausible_xai_code(cand, allow_numeric=allow_numeric):
             continue
         sc = _score_code(cand, hay, m.start())
+        left, _, right = cand.partition("-")
+        if left.isdigit() and right.isdigit() and sc < 4:
+            deferred_numeric.append(cand)
+            continue
         if sc > best_score:
             best_score = sc
             best = cand
     if best:
         return _normalize_code(best)
+
+    # Some Cloudflare templates omit the subject and split the semantic
+    # wording across HTML blocks.  If the same numeric code appears twice in
+    # a clearly SpaceXAI message, use that repeated value as a constrained
+    # fallback; isolated template numbers remain rejected.
+    if deferred_numeric and "spacexai" in hay.lower():
+        counts: dict[str, int] = {}
+        for cand in deferred_numeric:
+            counts[cand] = counts.get(cand, 0) + 1
+        repeated = next((cand for cand in deferred_numeric if counts[cand] >= 2), None)
+        if repeated:
+            return _normalize_code(repeated)
 
     for pattern in (
         r"verification\s+code[:\s]+(\d{4,8})",

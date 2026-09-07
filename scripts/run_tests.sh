@@ -14,6 +14,7 @@ tests=(
   tests/test_runtime_platform.py
   tests/test_windows_runtime.py
   tests/test_sso_recovery.py
+  tests/test_recovery_ops.py
   tests/test_sso_state.py
   tests/test_registration_risk_gate.py
   tests/test_quality_probe.py

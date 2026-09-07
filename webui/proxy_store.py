@@ -44,12 +44,15 @@ NETWORK_COOLDOWN_SECONDS = max(
 RISK_COOLDOWN_SECONDS = max(
     60, int(os.environ.get("PROXY_RISK_COOLDOWN_SECONDS", "1800"))
 )
+PROXY_IP_REFRESH_SECONDS = max(
+    30, int(os.environ.get("PROXY_IP_REFRESH_SECONDS", "300") or 300)
+)
 # 家宽口：风控不冷却、不禁用；换口改走 40 分钟内没出现过的 IP
 HOME_PROXY_PORTS = set(
     int(p)
     for p in str(os.environ.get("PROXY_HOME_PORTS", "") or "").split(",")
     if str(p).strip().isdigit()
-) or set(range(8001, 8012))
+) or (set(range(8001, 8012)) | set(range(17901, 17951)))
 IP_FRESH_SECONDS = max(
     60, int(os.environ.get("PROXY_IP_FRESH_SECONDS", str(40 * 60)))
 )
@@ -72,6 +75,28 @@ _TEST_JOB = {
     "finished_at": None,
     "testing_ids": [],
 }
+_REFRESH_LOCK = threading.RLock()
+_REFRESH_JOB = {
+    "running": False,
+    "job_id": None,
+    "total": 0,
+    "checked": 0,
+    "changed": 0,
+    "cleared": 0,
+    "failed": 0,
+    "started_at": None,
+    "finished_at": None,
+    "error": "",
+}
+_LOOP_GUARD = threading.Lock()
+_LOOP_STATE = {
+    "enabled": False,
+    "interval_seconds": int(PROXY_IP_REFRESH_SECONDS),
+    "next_at": "",
+}
+_LOOP_THREAD = None
+EXIT_IP_REFRESH_TIMEOUT = 4.0
+EXIT_IP_REFRESH_WORKERS = 4
 
 
 class ProxyValidationError(ValueError):
@@ -514,6 +539,7 @@ def read_proxy_pool() -> dict:
         "summary": summary,
         "items": items,
         "test_job": job,
+        "exit_ip_refresh": exit_ip_refresh_status(),
         "legacy": _legacy_info(),
         "updated_at": state.get("updated_at") or "",
         "mtime": mtime,
@@ -779,29 +805,31 @@ def probe_xai_signup(url: object, timeout: float = DEFAULT_TEST_TIMEOUT, *, http
     return detail
 
 
-def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
-    """Probe one proxy via public IP services and return non-secret metadata."""
+def probe_exit_ip(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
+    """Look up the current exit IP through the proxy. Does not hit xAI."""
     normalized = normalize_proxy(url)
-    timeout = max(2.0, min(float(timeout), 20.0))
+    timeout = max(1.5, min(float(timeout), 12.0))
     import requests
 
     session = requests.Session()
     session.trust_env = False
     proxies = {"http": normalized, "https": normalized}
+    # Fast JSON first; slower geo endpoints are fallbacks only.
     endpoints = (
-        "https://ipwho.is/",
-        "https://ipinfo.io/json",
         "https://api.ipify.org?format=json",
+        "https://ipinfo.io/json",
+        "https://ipwho.is/",
     )
     last_error = None
     result = None
     started = time.monotonic()
+    connect_timeout = min(2.0, timeout)
     for endpoint in endpoints:
         try:
             response = session.get(
                 endpoint,
                 proxies=proxies,
-                timeout=(min(4.0, timeout), timeout),
+                timeout=(connect_timeout, timeout),
                 headers={"Accept": "application/json", "User-Agent": "GrokRegister/1"},
             )
             response.raise_for_status()
@@ -822,8 +850,200 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
             last_error = exc
     if result is None:
         raise RuntimeError(_probe_error_message(last_error))
-    probe_xai_signup(normalized, timeout=timeout)
     return result
+
+
+def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
+    """Probe one proxy via public IP services and return non-secret metadata."""
+    result = probe_exit_ip(url, timeout=timeout)
+    probe_xai_signup(url, timeout=timeout)
+    return result
+
+
+def apply_changed_exit_ip(
+    url: object,
+    new_exit_ip: object,
+    *,
+    asn=None,
+    asn_org: object = "",
+    checked_at: object = "",
+) -> dict:
+    """Update a proxy's exit IP. On change, clear last_error only — not cooldown."""
+    try:
+        normalized = normalize_proxy(url)
+    except ProxyValidationError:
+        return {"ok": False, "cleared": False, "ip_changed": False}
+    new_ip = _clean_text(new_exit_ip, 64)
+    if not new_ip:
+        return {
+            "ok": False,
+            "cleared": False,
+            "ip_changed": False,
+            "url": normalized,
+        }
+    applied = {
+        "ok": False,
+        "cleared": False,
+        "ip_changed": False,
+        "url": normalized,
+        "old_ip": "",
+        "new_ip": new_ip,
+    }
+    with exclusive_file_lock(LOCK_PATH):
+        state, _ = _read_unlocked()
+        for item in state["items"]:
+            if item["url"] != normalized:
+                continue
+            old_ip = str(item.get("exit_ip") or "").strip()
+            ip_changed = bool(old_ip and new_ip and old_ip != new_ip)
+            had_error = bool(str(item.get("last_error") or "").strip())
+            item["exit_ip"] = new_ip
+            item["last_checked_at"] = _clean_text(checked_at, 40) or _utc_now()
+            if asn is not None:
+                try:
+                    item["asn"] = int(asn) if asn not in ("",) else item.get("asn")
+                except (TypeError, ValueError):
+                    pass
+            if asn_org:
+                item["asn_org"] = _clean_text(asn_org, 120)
+            cleared = False
+            if ip_changed:
+                item["last_error"] = ""
+                cleared = had_error
+            applied.update(
+                {
+                    "ok": True,
+                    "cleared": cleared,
+                    "ip_changed": ip_changed,
+                    "old_ip": old_ip,
+                    "new_ip": new_ip,
+                }
+            )
+            _write_unlocked(state)
+            break
+    return applied
+
+
+def refresh_dynamic_exit_ips(
+    *,
+    timeout: float = EXIT_IP_REFRESH_TIMEOUT,
+    extra_urls: list[str] | None = None,
+    probe_fn=None,
+    on_progress=None,
+) -> dict:
+    """Probe enabled nodes and clear risk when a dynamic exit IP has changed."""
+    probe = probe_fn or probe_exit_ip
+    timeout = max(1.5, min(float(timeout), 12.0))
+    urls: list[str] = []
+    seen: set[str] = set()
+    with exclusive_file_lock(LOCK_PATH):
+        state, _ = _read_unlocked()
+        for item in state["items"]:
+            if not item.get("enabled"):
+                continue
+            if _url_port(item.get("url")) in BLOCKED_WORKER_PORTS:
+                continue
+            url = str(item.get("url") or "")
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+    for raw in extra_urls or []:
+        try:
+            url = normalize_proxy(raw)
+        except ProxyValidationError:
+            continue
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    changed: list[dict] = []
+    cleared: list[dict] = []
+    failed = 0
+    done = 0
+
+    def _emit() -> None:
+        if not callable(on_progress):
+            return
+        on_progress(
+            {
+                "total": len(urls),
+                "checked": done,
+                "changed": len(changed),
+                "cleared": len(cleared),
+                "failed": failed,
+            }
+        )
+
+    _emit()
+    if not urls:
+        return {
+            "ok": True,
+            "checked": 0,
+            "changed": changed,
+            "cleared": cleared,
+            "failed": 0,
+        }
+
+    def _probe_one(url: str) -> tuple[str, dict | None]:
+        try:
+            return url, probe(url, timeout=timeout)
+        except Exception:
+            return url, None
+
+    workers = min(EXIT_IP_REFRESH_WORKERS, max(1, len(urls)))
+    overall = max(8.0, (len(urls) / max(workers, 1)) * (timeout + 1.5) + 4.0)
+    executor = ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="proxy-ip-refresh"
+    )
+    try:
+        futures = [executor.submit(_probe_one, url) for url in urls]
+        try:
+            completed = as_completed(futures, timeout=overall)
+            for future in completed:
+                try:
+                    url, probed = future.result(timeout=0.1)
+                except Exception:
+                    failed += 1
+                    done += 1
+                    _emit()
+                    continue
+                if not probed:
+                    failed += 1
+                    done += 1
+                    _emit()
+                    continue
+                try:
+                    applied = apply_changed_exit_ip(
+                        url,
+                        probed.get("exit_ip"),
+                        asn=probed.get("asn"),
+                        asn_org=probed.get("asn_org") or "",
+                        checked_at=probed.get("checked_at") or "",
+                    )
+                except Exception:
+                    failed += 1
+                    done += 1
+                    _emit()
+                    continue
+                if applied.get("ip_changed"):
+                    changed.append(applied)
+                if applied.get("cleared"):
+                    cleared.append(applied)
+                done += 1
+                _emit()
+        except TimeoutError:
+            unfinished = sum(1 for future in futures if not future.done())
+            failed += unfinished
+            done = min(len(urls), done + unfinished)
+            _emit()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return {
+        "ok": True,
+        "checked": len(urls),
+        "changed": changed,
+        "cleared": cleared,
+        "failed": failed,
+    }
 
 
 def _apply_probe_result(proxy_id: str, result: dict) -> None:
@@ -893,6 +1113,146 @@ def _run_test_job(job_id: str, selected: list[tuple[str, str]], timeout: float) 
                 _TEST_JOB["running"] = False
                 _TEST_JOB["finished_at"] = _utc_now()
                 _TEST_JOB["testing_ids"] = []
+
+
+def exit_ip_refresh_status() -> dict:
+    with _REFRESH_LOCK:
+        job = dict(_REFRESH_JOB)
+    with _LOOP_GUARD:
+        job["loop_enabled"] = bool(_LOOP_STATE.get("enabled"))
+        job["interval_seconds"] = int(
+            _LOOP_STATE.get("interval_seconds") or PROXY_IP_REFRESH_SECONDS
+        )
+        job["next_at"] = str(_LOOP_STATE.get("next_at") or "")
+    return job
+
+
+def start_exit_ip_refresh(*, timeout: float = EXIT_IP_REFRESH_TIMEOUT) -> dict:
+    """Manually probe exit IPs and clear risk when a dynamic node rotated."""
+    with _REFRESH_LOCK:
+        if _REFRESH_JOB.get("running"):
+            return {"ok": True, "already_running": True, **dict(_REFRESH_JOB)}
+        job_id = hashlib.sha256(f"ip-refresh:{time.time_ns()}".encode()).hexdigest()[:12]
+        _REFRESH_JOB.update(
+            {
+                "running": True,
+                "job_id": job_id,
+                "total": 0,
+                "checked": 0,
+                "changed": 0,
+                "cleared": 0,
+                "failed": 0,
+                "started_at": _utc_now(),
+                "finished_at": None,
+                "error": "",
+            }
+        )
+
+    def _on_progress(progress: dict) -> None:
+        with _REFRESH_LOCK:
+            if _REFRESH_JOB.get("job_id") != job_id:
+                return
+            _REFRESH_JOB.update(
+                {
+                    "total": int(progress.get("total") or 0),
+                    "checked": int(progress.get("checked") or 0),
+                    "changed": int(progress.get("changed") or 0),
+                    "cleared": int(progress.get("cleared") or 0),
+                    "failed": int(progress.get("failed") or 0),
+                }
+            )
+
+    def _run() -> None:
+        try:
+            result = refresh_dynamic_exit_ips(
+                timeout=timeout,
+                on_progress=_on_progress,
+            )
+            with _REFRESH_LOCK:
+                if _REFRESH_JOB.get("job_id") != job_id:
+                    return
+                _REFRESH_JOB.update(
+                    {
+                        "total": int(result.get("checked") or _REFRESH_JOB.get("total") or 0),
+                        "checked": int(result.get("checked") or 0),
+                        "changed": len(result.get("changed") or []),
+                        "cleared": len(result.get("cleared") or []),
+                        "failed": int(result.get("failed") or 0),
+                        "error": "",
+                    }
+                )
+        except Exception as exc:
+            with _REFRESH_LOCK:
+                if _REFRESH_JOB.get("job_id") == job_id:
+                    _REFRESH_JOB["error"] = _probe_error_message(exc)
+        finally:
+            with _REFRESH_LOCK:
+                if _REFRESH_JOB.get("job_id") == job_id:
+                    _REFRESH_JOB["running"] = False
+                    _REFRESH_JOB["finished_at"] = _utc_now()
+
+    threading.Thread(target=_run, name=f"proxy-ip-refresh-{job_id}", daemon=True).start()
+    return {"ok": True, **exit_ip_refresh_status()}
+
+
+def _exit_ip_refresh_loop() -> None:
+    while True:
+        with _LOOP_GUARD:
+            enabled = bool(_LOOP_STATE.get("enabled"))
+            next_at = _parse_utc(_LOOP_STATE.get("next_at"))
+            interval = int(
+                _LOOP_STATE.get("interval_seconds") or PROXY_IP_REFRESH_SECONDS
+            )
+        if not enabled:
+            time.sleep(0.4)
+            continue
+        now = datetime.now(timezone.utc)
+        delay = (next_at - now).total_seconds() if next_at else 0.0
+        if delay > 0:
+            time.sleep(min(delay, 0.4))
+            continue
+        with _REFRESH_LOCK:
+            running = bool(_REFRESH_JOB.get("running"))
+        if running:
+            time.sleep(0.4)
+            continue
+        start_exit_ip_refresh()
+        with _LOOP_GUARD:
+            if _LOOP_STATE.get("enabled"):
+                _LOOP_STATE["next_at"] = _future_utc(max(30, interval))
+
+
+def _ensure_exit_ip_refresh_loop_thread() -> None:
+    global _LOOP_THREAD
+    with _LOOP_GUARD:
+        if _LOOP_THREAD is not None and _LOOP_THREAD.is_alive():
+            return
+        _LOOP_THREAD = threading.Thread(
+            target=_exit_ip_refresh_loop,
+            name="proxy-ip-refresh-loop",
+            daemon=True,
+        )
+        _LOOP_THREAD.start()
+
+
+def set_exit_ip_refresh_enabled(enabled: object = None) -> dict:
+    """Toggle the 300s exit-IP refresh loop. Enabling fires one refresh immediately."""
+    with _LOOP_GUARD:
+        if enabled is None:
+            turn_on = not bool(_LOOP_STATE.get("enabled"))
+        else:
+            turn_on = bool(enabled)
+        interval = max(30, int(_LOOP_STATE.get("interval_seconds") or PROXY_IP_REFRESH_SECONDS))
+        _LOOP_STATE["enabled"] = turn_on
+        _LOOP_STATE["interval_seconds"] = interval
+        if turn_on:
+            _LOOP_STATE["next_at"] = _future_utc(interval)
+        else:
+            _LOOP_STATE["next_at"] = ""
+    if turn_on:
+        _ensure_exit_ip_refresh_loop_thread()
+        start_exit_ip_refresh()
+    return {"ok": True, **exit_ip_refresh_status()}
 
 
 def start_proxy_tests(ids: object = None, *, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:

@@ -136,6 +136,7 @@ def batch_launch_command(
     interpreter = Path(python_path) if python_path else runtime_python(
         project_root,
         platform_name=platform_name,
+        environ=environ,
     )
     command = [
         str(interpreter),
@@ -304,8 +305,12 @@ def apply_playwright_node_env(
             str(real_node) if real_node is not None else "/usr/bin/node"
         )
     if platform.startswith("win") and guard.is_file() and spawn is not None:
-        marker = str(guard)
-        extra = f'--require "{marker}"'
+        # Node parses NODE_OPTIONS independently of CreateProcess. On Windows
+        # backslashes in an unescaped absolute path are treated as escapes,
+        # producing paths such as ``E:Register...``. Forward slashes are
+        # accepted by Node and remain stable through the environment boundary.
+        marker = guard.as_posix()
+        extra = f"--require {marker}"
         existing = str(env.get("NODE_OPTIONS") or "")
         if marker not in existing:
             env["NODE_OPTIONS"] = f"{existing} {extra}".strip()

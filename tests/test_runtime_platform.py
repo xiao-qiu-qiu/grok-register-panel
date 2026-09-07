@@ -45,9 +45,10 @@ def test_runtime_python_uses_platform_virtualenv_layout():
         root = Path(temp)
         posix_python = _touch(root / ".venv" / "bin" / "python")
         windows_python = _touch(root / ".venv" / "Scripts" / "python.exe")
-        assert runtime_python(root, platform_name="linux") == posix_python.resolve()
-        assert runtime_python(root, platform_name="darwin") == posix_python.resolve()
-        assert runtime_python(root, platform_name="win32") == windows_python.resolve()
+        isolated = {}
+        assert runtime_python(root, platform_name="linux", environ=isolated) == posix_python.resolve()
+        assert runtime_python(root, platform_name="darwin", environ=isolated) == posix_python.resolve()
+        assert runtime_python(root, platform_name="win32", environ=isolated) == windows_python.resolve()
 
 
 def test_runtime_python_falls_back_to_active_interpreter():
@@ -222,7 +223,8 @@ def test_windows_playwright_node_skips_posix_wrapper():
     assert out["GROK_PLAYWRIGHT_NODE"] != str(wrapper)
     options = out.get("NODE_OPTIONS", "")
     assert "playwright-epipe-guard.js" in options
-    assert "--require \"" in options
+    assert "--require " in options
+    assert "\\" not in options
     assert out["PLAYWRIGHT_NODEJS_PATH"].endswith("node.exe")
 
 

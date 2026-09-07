@@ -133,6 +133,8 @@ powershell -ExecutionPolicy Bypass -File scripts\run_windows_batch.ps1 -Count 1 
 powershell -ExecutionPolicy Bypass -File scripts\run_windows_panel.ps1
 ```
 
+Windows 面板会把 `MONITOR_TOKEN` 写入 `.env.monitor` 并在启动窗口打印 `token=`。浏览器「访问令牌」必须贴同一串；换浏览器或清站点数据后重新粘贴一次即可。
+
 Windows 不要把 `PLAYWRIGHT_NODEJS_PATH` 指到 `scripts/playwright-node`（那是 bash 包装）。运行时会解析 `node.exe` 或 Playwright 自带 Node，并用带引号的 `NODE_OPTIONS --require` 注入 EPIPE 保护。代理请写 **Windows 本机可达** 的 URL（例如 `socks5://user:pass@gate.example:1000`），不要沿用 Linux 上的 `127.0.0.1:82xx` mixed 口。
 
 > `pip install` 只装 Python 依赖；**不执行 `camoufox fetch` 无法启动浏览器**。
@@ -145,6 +147,7 @@ Windows 不要把 `PLAYWRIGHT_NODEJS_PATH` 指到 `scripts/playwright-node`（�
 | `outlook_rt_inventory` | Outlook MSA 库存路径（jsonl：`email`+`refresh_token`；或 `email----rt`） |
 | `outlook_rt_used_path` | 已用邮箱记录（可选；默认 `库存路径.used`） |
 | `outlook_rt_client_id` | 可选 Client ID；默认 Microsoft Authentication Broker 公共客户端 |
+| `outlook_rt_skip_empty_inbox` | 可选 Inbox 预检，默认 `false`；注册前空箱是正常状态，设为 `true` 才会跳过空箱 |
 | `defaultDomains` | 临时邮域名（如二级 CF 域） |
 | `cloudflare_*` / `duckmail_*` 等 | 对应邮箱 API |
 | `cloudflare_randomize_subdomain` | 默认 `true`；为管理域名生成随机子域，要求泛域收信；不支持时设为 `false` |
@@ -159,10 +162,11 @@ Windows 不要把 `PLAYWRIGHT_NODEJS_PATH` 指到 `scripts/playwright-node`（�
 | `proxies.txt` | 可选的旧版多行代理文件；未配置面板代理池时继续兼容 |
 | `register_workers` | 并发浏览器数（建议先 2～3） |
 | `register_count` | 单次目标数量 |
-| `cpa_auto_add` | 是否 SSO→OAuth 并写入 auth |
+| `cpa_auto_add` | 是否 SSO→OAuth 并写入 CPA |
+| `grok2api_auto_add` | 是否把成功账号的原始 SSO 追加到 `grok2api_auth_dir/sso.txt`（一行一个 SSO） |
 | `cpa_auth_dir` | 本地 CPA 目录（`xai-*.json`） |
-| `grok2api_auth_dir` | Grok2API 风格 auth 目录 |
-| `quality_probe_on_register` | 默认 `false`；打开后写入 auth 才短测降智。补录 CLI 用 `--quality-probe` |
+| `grok2api_auth_dir` | Grok2API 汇总 SSO 目录（写入该目录下的 `sso.txt`，一行一个 SSO） |
+| `quality_probe_on_register` | 默认 `false`；打开后写入 CPA auth 才短测降智。补录 CLI 用 `--quality-probe` |
 | `cpa_remote_url` / `cpa_management_key` | 远程 CPA Management API（可选） |
 
 ### 环境变量
@@ -180,6 +184,8 @@ Windows 不要把 `PLAYWRIGHT_NODEJS_PATH` 指到 `scripts/playwright-node`（�
 | `GROK_BATCH_MAX_RESTARTS` | `2` | 单批发生驱动崩溃或卡死时最多自动恢复次数 |
 | `GROK_BROWSER_START_ATTEMPTS` | `2` | 同一代理的 Camoufox 启动尝试次数，范围 1-4 |
 | `GROK_PROXY_BOOT_ROTATIONS` | `3` | 浏览器启动失败后最多更换的代理数，范围 0-10 |
+| `PROXY_SUCCESS_ROTATE_EVERY` | `3` | 同一 worker 每成功注册多少个账号后强制换到下一个代理节点 |
+| `PROXY_IP_REFRESH_SECONDS` | `300` | 动态节点出口 IP 自动探测间隔；发现 IP 变化后清除该节点风控/冷却 |
 | `GROK_SLOT_RETRIES` | `1` | 单账号槽位软失败时的重试次数，范围 0-3 |
 | `GROK_ORCH_MAX_CONSECUTIVE_FAILURES` | `2` | 连续异常批次达到该值时停止编排，范围 1-10 |
 | `GROK_PYTHON_BIN` | 项目 `.venv` 或当前解释器 | 可选：显式指定面板启动任务所用的 Python，支持项目外共享虚拟环境 |
@@ -509,8 +515,8 @@ PYTHON_BIN=.venv/bin/python scripts/run_tests.sh
 
 ## 常见问题
 
-**Q: 点启动报 `unauthorized: set MONITOR_TOKEN...`？**  
-A: 服务端已启用写接口鉴权。启动 monitor 时 `export MONITOR_TOKEN=...`，浏览器 **面板 Token** 填同一串（或 `localStorage.setItem`）。硬刷新后再点启动。
+**Q: 点启动报 `unauthorized: set MONITOR_TOKEN...` 或「访问令牌不匹配」？**
+A: 服务端已启用写接口鉴权。启动窗口打印的 `token=` / `MONITOR_TOKEN` 必须和浏览器「访问令牌」相同。Windows 面板脚本会把令牌写入 `.env.monitor` 供下次复用；若仍不匹配，以**本次启动窗口**打印的值为准，不要用浏览器里记住的旧串。硬刷新后再点启动。
 
 **Q: 日志尾部显示 `raw log tail disabled`？**  
 A: 默认关闭防泄密。需要时 `export PANEL_INCLUDE_TAIL=1` 后重启 `monitor.py`。

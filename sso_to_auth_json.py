@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-SSO cookie → CPA / Grok2API auth.json 格式（纯 HTTP）
+SSO cookie → CPA auth.json / Grok2API 单行 SSO（纯 HTTP）
 
 主路径：RFC 8628 Device Flow（对齐 CLIProxyAPI internal/auth/xai + verify/approve）
 回退：Authorization Code + PKCE（referrer=grok-build + plan=generic）
 
 写出：
   - CLIProxyAPI 扁平 xai-*.json（base_url=cli-chat-proxy.grok.com）
-  - Grok2API / ~/.grok 风格 issuer::client_id 嵌套 auth
+  - Grok2API 目录内单文件 sso.txt（一行一个原始 SSO）
 
 用法:
   # 单个 / 批量 SSO，写出多个独立 auth 文件（每个可直接 cp 到 ~/.grok/auth.json）
@@ -446,7 +446,7 @@ def scan_cpa_auth_dir_bfs(
         summary["error"] = f"auth_dir not found: {root}"
         return summary
 
-    # Auth directories can contain generated xai-/g2a- files or a merged
+    # Auth directories can contain generated xai- files or a merged
     # auth.json created by the CLI. Scan JSON files by content rather than
     # relying on one filename convention.
     paths = sorted(root.glob("*.json"))
@@ -1879,34 +1879,65 @@ def write_cpa_auth(auth_dir: Path, record: dict) -> Path:
     return path
 
 
-def grok2api_auth_filename(entry: dict, email: str = "") -> str:
-    """Grok2API / 官方 grok 风格文件名。"""
-    ident = (
-        str(email or "").strip()
-        or str(entry.get("email") or "").strip()
-        or str(entry.get("user_id") or "").strip()
-        or secrets.token_hex(4)
-    )
-    safe = _safe_email_for_filename(ident)
-    return f"g2a-{safe}.json"
+GROK2API_SSO_FILENAME = "sso.txt"
+
+
+def _normalize_grok2api_sso(sso: str) -> str:
+    raw_sso = str(sso or "").strip()
+    if raw_sso.startswith("sso="):
+        raw_sso = raw_sso[4:].strip()
+    if len(raw_sso) < 24 or any(ch.isspace() for ch in raw_sso):
+        raise ValueError("Grok2API SSO 为空或格式无效")
+    return raw_sso
+
+
+def grok2api_auth_filename(entry: dict | None = None, email: str = "") -> str:
+    """Grok2API 汇总 SSO 文件名（目录内固定单文件）。"""
+    return GROK2API_SSO_FILENAME
+
+
+def grok2api_sso_path(auth_dir: Path) -> Path:
+    return Path(auth_dir) / GROK2API_SSO_FILENAME
+
+
+def _append_grok2api_sso(auth_dir: Path, raw_sso: str) -> Path:
+    """把一条 SSO 追加到目录内的 sso.txt；重复值跳过。"""
+    ensure_private_dir(auth_dir)
+    path = grok2api_sso_path(auth_dir)
+    lock_path = path.with_name(path.name + ".lock")
+    with exclusive_file_lock(lock_path):
+        duplicate = False
+        try:
+            for existing in path.read_text(encoding="utf-8").splitlines():
+                line = existing.strip()
+                if line.startswith("sso="):
+                    line = line[4:].strip()
+                if line == raw_sso:
+                    duplicate = True
+                    break
+        except OSError:
+            pass
+        if not duplicate:
+            append_private_text(path, raw_sso + "\n")
+    return path
 
 
 def write_grok2api_auth(
     auth_dir: Path,
     token: dict,
+    *,
+    sso: str,
     email: str = "",
     extra: dict | None = None,
 ) -> Path:
-    """写出 Grok2API / ~/.grok 风格 auth（issuer::client_id 嵌套）。"""
-    ensure_private_dir(auth_dir)
-    key, entry = token_to_auth_entry(token, email=email)
-    if isinstance(extra, dict):
-        for field, value in extra.items():
-            if str(field).startswith("quality_"):
-                entry[field] = value
-    path = auth_dir / grok2api_auth_filename(entry, email=email)
-    write_auth_json(path, key, entry)
-    return path
+    """追加一条 Grok2API SSO 到目录内的 sso.txt。quality extra 由 CPA 记录承载。"""
+    del extra
+    return _append_grok2api_sso(auth_dir, _normalize_grok2api_sso(sso))
+
+
+def write_grok2api_raw_sso(auth_dir: Path, sso: str, *, email: str = "") -> Path:
+    """离线追加原始 SSO，不触发 OAuth 换 token。"""
+    return _append_grok2api_sso(auth_dir, _normalize_grok2api_sso(sso))
 
 
 def upload_cpa_auth_remote(
@@ -2142,7 +2173,11 @@ def apply_config_defaults(args) -> None:
         args.grok2api_auth_dir = _resolve_config_path(base, config.get("grok2api_auth_dir"))
     args.cpa_remote_url = args.cpa_remote_url or str(config.get("cpa_remote_url") or "").strip()
     args.cpa_management_key = args.cpa_management_key or str(config.get("cpa_management_key") or "").strip()
-    args.proxy = args.proxy or str(config.get("proxy") or "").strip()
+    args.proxy = (
+        args.proxy
+        or str(config.get("proxy") or "").strip()
+        or str(os.environ.get("GROK_RECOVERY_PROXY") or "").strip()
+    )
     if getattr(args, "bfs_check", None) is None:
         args.bfs_check = _config_bool(config.get("bfs_check"), True)
     if getattr(args, "bfs_skip_write", None) is None:
@@ -2195,7 +2230,19 @@ def existing_cpa_emails(auth_dir: str | Path | None) -> set[str]:
     return emails
 
 
+def _configure_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            pass
+
+
 def main() -> int:
+    _configure_utf8_stdio()
     ap = argparse.ArgumentParser(description="SSO cookie → grok auth.json (纯 HTTP)")
     ap.add_argument("--sso", metavar="FILE", help="sso 列表文件（一行一个 JWT，或 邮箱----密码----sso）")
     ap.add_argument("--sso-cookie", metavar="JWT", help="单个 sso cookie")
@@ -2232,7 +2279,7 @@ def main() -> int:
     ap.add_argument(
         "--grok2api-auth-dir",
         default=None,
-        help="额外写出 Grok2API / ~/.grok 风格 g2a-<email>.json 到该目录",
+        help="额外把原始 SSO 追加到该目录的 sso.txt（一行一个 SSO）",
     )
     ap.add_argument(
         "--prefer",
@@ -2525,7 +2572,16 @@ def main() -> int:
                     print(f"  💾 {args.out}")
 
             cpa_record = None
-            if args.grok2api_auth_dir or args.cpa_auth_dir or args.cpa_remote_url:
+            if args.grok2api_auth_dir:
+                gp = write_grok2api_auth(
+                    Path(args.grok2api_auth_dir),
+                    token,
+                    sso=sso,
+                    email=email,
+                )
+                print(f"  💾 Grok2API → {gp}")
+
+            if args.cpa_auth_dir or args.cpa_remote_url:
                 cpa_record = token_to_cpa_record(
                     token,
                     email=email,
@@ -2538,22 +2594,6 @@ def main() -> int:
                     print("  ⚠️ bfs 账号已标记 disabled=true")
                 if args.quality_probe:
                     stamp_converted_record_quality(cpa_record, proxy=args.proxy)
-
-            if args.grok2api_auth_dir:
-                extra = None
-                if isinstance(cpa_record, dict):
-                    extra = {
-                        key: cpa_record[key]
-                        for key in cpa_record
-                        if str(key).startswith("quality_")
-                    }
-                gp = write_grok2api_auth(
-                    Path(args.grok2api_auth_dir),
-                    token,
-                    email=email,
-                    extra=extra,
-                )
-                print(f"  💾 Grok2API → {gp}")
 
             if cpa_record is not None and (args.cpa_auth_dir or args.cpa_remote_url):
                 if args.cpa_auth_dir:

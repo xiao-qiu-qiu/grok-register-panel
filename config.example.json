@@ -27,6 +27,7 @@
   "cpa_auth_dir": "cpa_auth",
   "cpa_remote_url": "",
   "cpa_management_key": "",
+  "grok2api_auto_add": true,
   "grok2api_auth_dir": "grok2api_auth",
   "quality_probe_on_register": false,
   "bfs_check": true,
@@ -46,6 +47,7 @@
   "outlook_rt_inventory": "",
   "outlook_rt_used_path": "",
   "outlook_rt_client_id": "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+  "outlook_rt_skip_empty_inbox": false,
   "inbucket_api_base": "",
   "inbucket_domain": "",
   "inbucket_random_levels": "0"

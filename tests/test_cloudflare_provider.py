@@ -61,11 +61,37 @@ def test_address_collision_retries_with_admin_payload():
     assert len(calls) == 2
     assert calls[0][1]["json"] == {
         "name": "fixed-name",
-        "enablePrefix": False,
+        "enablePrefix": True,
         "domain": "mail.example",
     }
     assert calls[1][1]["json"]["name"] != "fixed-name"
     assert "password" not in calls[0][1]["json"]
+
+
+def test_random_subdomain_is_sent_as_worker_flag():
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse(
+            200,
+            data={"address": "user@abcd1234.mail.example", "jwt": "test-jwt"},
+        )
+
+    result = cloudflare.create_temp_address(
+        fake_post,
+        "https://mail.example",
+        accounts_path="/api/new_address",
+        domain="mail.example",
+        randomize_subdomain=True,
+    )
+
+    assert result == ("user@abcd1234.mail.example", "test-jwt")
+    assert calls[0][1]["json"] == {
+        "domain": "mail.example",
+        "enableRandomSubdomain": True,
+    }
+    assert calls[0][1]["headers"] == {"Content-Type": "application/json"}
 
 
 def test_nonretryable_400_is_not_retried_or_echoed():

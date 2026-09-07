@@ -72,8 +72,9 @@ def test_add_sso_to_cpa_stamps_quality_before_write():
         }
         register._s2cpa.stamp_converted_record_quality = _fake_stamp
         try:
+            sso_token = "t" * 80
             result = register.add_sso_to_cpa(
-                "sso=test-sso-token",
+                f"sso={sso_token}",
                 email="auto@example.test",
             )
             assert result is True
@@ -83,11 +84,9 @@ def test_add_sso_to_cpa_stamps_quality_before_write():
             assert cpa["quality_verdict"] == "healthy"
             assert cpa["quality_has_thinking"] is True
             assert "opaque-access-token" in cpa.get("access_token", "")
-            g2a_files = list(g2a_dir.glob("*.json"))
-            assert len(g2a_files) == 1
-            g2a = json.loads(g2a_files[0].read_text(encoding="utf-8"))
-            nested = next(value for value in g2a.values() if isinstance(value, dict))
-            assert nested["quality_verdict"] == "healthy"
+            g2a_path = g2a_dir / "sso.txt"
+            assert g2a_path.is_file()
+            assert sso_token in g2a_path.read_text(encoding="utf-8")
         finally:
             (
                 register._resolve_cpa_proxy,
@@ -154,22 +153,21 @@ def test_add_sso_to_cpa_can_skip_quality_probe():
                     register.config[key] = value
 
 
-def test_write_grok2api_auth_keeps_quality_extra():
+def test_write_grok2api_auth_appends_raw_sso():
     with tempfile.TemporaryDirectory() as temp:
         path = write_grok2api_auth(
             Path(temp),
             {"access_token": "tok", "refresh_token": "rt"},
+            sso="sso=" + ("a" * 80),
             email="g2a@example.test",
             extra={"quality_verdict": "hard", "unrelated": "nope"},
         )
-        data = json.loads(path.read_text(encoding="utf-8"))
-        nested = next(value for value in data.values() if isinstance(value, dict))
-        assert nested["quality_verdict"] == "hard"
-        assert "unrelated" not in nested
+        assert path.name == "sso.txt"
+        assert path.read_text(encoding="utf-8") == ("a" * 80) + "\n"
 
 
 if __name__ == "__main__":
     test_add_sso_to_cpa_stamps_quality_before_write()
     test_add_sso_to_cpa_can_skip_quality_probe()
-    test_write_grok2api_auth_keeps_quality_extra()
+    test_write_grok2api_auth_appends_raw_sso()
     print("OK quality register")

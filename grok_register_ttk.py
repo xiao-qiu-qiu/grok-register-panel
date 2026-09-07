@@ -60,9 +60,11 @@ from secure_files import (
 )
 from webui.proxy_store import (
     IP_FRESH_SECONDS as _PROXY_IP_FRESH_SECONDS,
+    PROXY_IP_REFRESH_SECONDS as _PROXY_IP_REFRESH_SECONDS,
     mark_proxy_used as _mark_managed_proxy_used,
     note_proxy_exit as _note_managed_proxy_exit,
     record_proxy_result as _record_managed_proxy_result,
+    refresh_dynamic_exit_ips as _refresh_dynamic_exit_ips,
     restore_home_proxies as _restore_home_proxies,
     worker_proxy_details as _managed_worker_proxy_details,
     worker_proxy_snapshot as _managed_worker_proxy_snapshot,
@@ -226,7 +228,8 @@ DEFAULT_CONFIG = {
     # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
     "cpa_remote_url": "",
     "cpa_management_key": "",
-    # Grok2API / ~/.grok 风格 auth 目录（默认项目根目录下 grok2api_auth/）
+    "grok2api_auto_add": True,
+    # Grok2API 汇总 SSO 目录（默认 grok2api_auth/sso.txt，一行一个 SSO）
     "grok2api_auth_dir": "grok2api_auth",
     # 写入 CPA / Grok2API 后立刻短测降智（短 prompt，见到 thinking 即停）
     "quality_probe_on_register": False,
@@ -247,6 +250,8 @@ DEFAULT_CONFIG = {
     "outlook_rt_inventory": "",
     "outlook_rt_used_path": "",
     "outlook_rt_client_id": outlook_rt_provider.DEFAULT_CLIENT_ID,
+    # Inbox 预检默认关闭：注册前邮箱为空是正常状态，不代表无法收信
+    "outlook_rt_skip_empty_inbox": False,
     # 账号间注册间隔（秒），0=不等待。填一个整数=N秒固定等待，填区间"60-120"=随机等待
     "account_interval": "60-120",
 }
@@ -281,7 +286,7 @@ class EmailDomainRejected(Exception):
 
 
 class RegistrationRiskDenied(Exception):
-    """账号已创建，但服务端将本次注册裁决为 OAuth 不可用。"""
+    """账号已创建，但风控拒绝或其状态无法可靠确认，禁止后续 OAuth。"""
 
 
 
@@ -344,6 +349,21 @@ FAIL_LABELS = {
 }
 
 
+def is_proxy_navigation_failure(exc) -> bool:
+    """Return whether a browser navigation error points to a reset proxy path."""
+    low = str(exc or "").lower()
+    return any(
+        marker in low
+        for marker in (
+            "ns_error_net_reset",
+            "ns_error_connection_reset",
+            "err_connection_reset",
+            "net::err_connection_reset",
+            "err_proxy_connection_failed",
+        )
+    )
+
+
 
 _RESULT_LOG_LOCK = threading.Lock()
 _RESULT_LOG_PATH = os.path.join(
@@ -387,8 +407,12 @@ def record_register_result(
             _record_managed_proxy_result(proxy, "success")
         elif status == "risk" or kind == FAIL_RISK:
             _record_managed_proxy_result(proxy, "risk", detail)
+            if proxy:
+                _exclude_proxy_until_exit_ip_changes(proxy)
         elif kind == FAIL_BROWSER:
             _record_managed_proxy_result(proxy, "network", detail)
+            if proxy:
+                _exclude_proxy_until_exit_ip_changes(proxy)
     except Exception:
         pass
     # 从 proxy URL 抽端口
@@ -401,10 +425,12 @@ def record_register_result(
     except Exception:
         pass
 
+    email_consumed = bool(str(email or "").strip())
     rec = {
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "status": status,
         "email": mask_email(email or ""),
+        "email_consumed": email_consumed,
         "kind": kind or "",
         "detail": redact_sensitive_log_line(detail or "")[:300],
         "worker": worker or "",
@@ -423,7 +449,8 @@ def record_register_result(
         bfs_txt = "clean"
     line = (
         f"[结果] status={status} ip={exit_ip or '?'} port={port or '?'} "
-        f"email={mask_email(email) if email else '-'} kind={kind or '-'} bot={bot_flag if bot_flag is not None else '-'} "
+        f"email={mask_email(email) if email else '-'} email_used={1 if email_consumed else 0} "
+        f"kind={kind or '-'} bot={bot_flag if bot_flag is not None else '-'} "
         f"risk={risk if risk is not None else '-'} bfs={bfs_txt}"
     )
     if log_callback:
@@ -486,6 +513,7 @@ def classify_failure(exc) -> str:
         or "与页面的连接已断开" in msg
         or "PageDisconnected" in msg
         or "disconnected" in low
+        or is_proxy_navigation_failure(exc)
     ):
         return FAIL_BROWSER
     if "[CPA]" in msg or ("CPA" in msg and ("失败" in msg or "跳过" in msg)):
@@ -611,9 +639,17 @@ _proxy_pool: list = []
 _proxy_pool_lock = threading.Lock()
 _proxy_pool_source = "none"
 _proxy_leases: dict = {}
+_proxy_lease_rotations: dict = {}
 _proxy_lease_lock = threading.Lock()
+_startup_excluded_proxies: dict[str, str] = {}
+_ip_refresh_guard = threading.Lock()
+_ip_refresh_thread = None
+_ip_refresh_stop = threading.Event()
 _submit_slot_lock = threading.Lock()
 _next_submit_at = 0.0
+PROXY_SUCCESS_ROTATE_EVERY = max(
+    1, int(os.environ.get("PROXY_SUCCESS_ROTATE_EVERY", "3") or 3)
+)
 # 各窗口提交邮箱至少隔这么久，避免同时打 xAI 验证码
 SIGNUP_SUBMIT_GAP_SECONDS = max(
     0.0, float(os.environ.get("SIGNUP_SUBMIT_GAP_SECONDS", "7") or 7)
@@ -687,14 +723,18 @@ def release_proxy_lease(worker_id: int | None = None) -> None:
     with _proxy_lease_lock:
         if worker_id is None:
             _proxy_leases.clear()
+            _proxy_lease_rotations.clear()
             return
-        _proxy_leases.pop(int(worker_id), None)
+        wid = int(worker_id)
+        _proxy_leases.pop(wid, None)
+        _proxy_lease_rotations.pop(wid, None)
 
 
 def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
-    """账号边界选口：跳过别人占用的，优先 40 分钟内没出现过的出口 IP。
+    """账号边界选口：同一轮换序号复用当前口，轮换时避开占用口。
 
-    风控前置：当前口的 IP 若在窗口内用过，即使 rotate_idx=0 也换一条冷 IP。
+    正常注册按 PROXY_SUCCESS_ROTATE_EVERY 个成功账号切一次；网络/风控失败
+    bump rotate_idx 时立刻换口，并优先 40 分钟内没出现过的出口 IP。
     """
     pool = load_proxy_pool()
     details = []
@@ -704,13 +744,23 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
         details = []
     if details:
         pool = [str(row.get("url") or "") for row in details if row.get("url")]
+    # 本次启动预检已确认失败的端口即使是家宽监听器也不能立即复用。
+    # 家宽池保留 cooldown 是为了跨批次恢复；这里仅做当前批次的临时排除。
+    # 面板刷新出口 IP 后，这里按新 IP 自动解除排除。
+    by_url = {str(row.get("url") or ""): row for row in details}
+    for url, old_ip in list(_startup_excluded_proxies.items()):
+        new_ip = str((by_url.get(url) or {}).get("exit_ip") or "").strip()
+        if new_ip and old_ip and new_ip != old_ip:
+            _startup_excluded_proxies.pop(url, None)
+    blocked = set(_startup_excluded_proxies)
+    if blocked:
+        pool = [candidate for candidate in pool if candidate not in blocked]
     if not pool:
         if _proxy_pool_source == "managed-empty":
             raise RuntimeError("面板代理池没有健康且启用的代理，请先检测或等待冷却结束")
         return str(config.get("proxy", "") or "").strip()
     wid = max(0, int(worker_id))
     rot = max(0, int(rotate_idx))
-    by_url = {str(row.get("url") or ""): row for row in details}
     now = datetime.datetime.now(datetime.timezone.utc)
 
     def _age(url: str) -> float:
@@ -730,37 +780,44 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
     fresh = max(60, int(_PROXY_IP_FRESH_SECONDS or 2400))
     with _proxy_lease_lock:
         current = _proxy_leases.get(wid)
+        previous_rot = _proxy_lease_rotations.get(wid)
+        rotate_requested = bool(current) and previous_rot is not None and rot != previous_rot
         others = {url for owner, url in _proxy_leases.items() if owner != wid}
-        avoid = set(others)
-        if current and (_age(current) < fresh or rot > 0):
-            avoid.add(current)
-        # 同 IP 也避开（两条口偶发同一 sticky）
-        hot_ips = set()
-        for url, row in by_url.items():
-            ip = str(row.get("exit_ip") or "").strip()
-            if ip and _age(url) < fresh:
-                hot_ips.add(ip)
-        ranked = []
-        for offset, cand in enumerate(pool):
-            if cand in avoid:
-                continue
-            ip = str((by_url.get(cand) or {}).get("exit_ip") or "").strip()
-            if ip and ip in hot_ips and cand != current:
-                continue
-            ranked.append((-_age(cand), offset, cand))
-        ranked.sort()
-        selected = ranked[0][2] if ranked else ""
-        if not selected:
-            leftovers = [
-                (-_age(cand), idx, cand)
-                for idx, cand in enumerate(pool)
-                if cand not in others
-            ]
-            leftovers.sort()
-            selected = leftovers[0][2] if leftovers else ""
-        if not selected:
-            selected = pool[(wid + rot) % len(pool)]
+        if current and current in pool and not rotate_requested:
+            _proxy_lease_rotations[wid] = rot
+            selected = current
+        else:
+            avoid = set(others)
+            if current and rotate_requested:
+                avoid.add(current)
+            # 同 IP 也避开（两条口偶发同一 sticky）
+            hot_ips = set()
+            for url, row in by_url.items():
+                ip = str(row.get("exit_ip") or "").strip()
+                if ip and _age(url) < fresh:
+                    hot_ips.add(ip)
+            ranked = []
+            for offset, cand in enumerate(pool):
+                if cand in avoid:
+                    continue
+                ip = str((by_url.get(cand) or {}).get("exit_ip") or "").strip()
+                if ip and ip in hot_ips and cand != current:
+                    continue
+                ranked.append((-_age(cand), offset, cand))
+            ranked.sort()
+            selected = ranked[0][2] if ranked else ""
+            if not selected:
+                leftovers = [
+                    (-_age(cand), idx, cand)
+                    for idx, cand in enumerate(pool)
+                    if cand not in others
+                ]
+                leftovers.sort()
+                selected = leftovers[0][2] if leftovers else ""
+            if not selected:
+                selected = pool[(wid + rot) % len(pool)]
         _proxy_leases[wid] = selected
+        _proxy_lease_rotations[wid] = rot
     try:
         _mark_managed_proxy_used(selected)
     except Exception:
@@ -775,6 +832,81 @@ def get_proxies():
     return {}
 
 
+def _exclude_proxy_until_exit_ip_changes(proxy: str, log_callback=None) -> None:
+    url = str(proxy or "").strip()
+    if not url:
+        return
+    exit_ip = ""
+    try:
+        exit_ip = str(get_exit_ip() or "")
+    except Exception:
+        exit_ip = ""
+    _startup_excluded_proxies[url] = exit_ip
+    if log_callback:
+        log_callback(f"[*] 本批暂不用该节点，待出口 IP 变化后再用: {redact_proxy(url)}")
+
+
+def _run_dynamic_proxy_ip_refresh(log_callback=None) -> dict:
+    extra = [url for url in list(_startup_excluded_proxies) if url]
+    result = _refresh_dynamic_exit_ips(extra_urls=extra)
+    revived = 0
+    for row in result.get("changed") or []:
+        url = str(row.get("url") or "")
+        if url:
+            _startup_excluded_proxies.pop(url, None)
+            revived += 1
+        if not log_callback:
+            continue
+        old_ip = row.get("old_ip") or "-"
+        new_ip = row.get("new_ip") or "-"
+        if row.get("cleared"):
+            log_callback(
+                f"[*] 节点出口 IP 已变化 {old_ip} → {new_ip}，已清除风控状态 "
+                f"{redact_proxy(url)}"
+            )
+        else:
+            log_callback(
+                f"[*] 节点出口 IP 已变化 {old_ip} → {new_ip} {redact_proxy(url)}"
+            )
+    if log_callback and result.get("checked"):
+        log_callback(
+            f"[*] 动态节点探测完成: 检查 {result.get('checked')} 条，"
+            f"IP 变化 {len(result.get('changed') or [])}，"
+            f"清除风控 {len(result.get('cleared') or [])}，"
+            f"失败 {result.get('failed') or 0}"
+        )
+    return result
+
+
+def start_dynamic_proxy_ip_refresh(log_callback=None) -> None:
+    """Every 300s, probe exit IPs and clear risk when a dynamic node rotated."""
+    global _ip_refresh_thread
+    interval = max(30, int(_PROXY_IP_REFRESH_SECONDS or 300))
+    with _ip_refresh_guard:
+        if _ip_refresh_thread is not None and _ip_refresh_thread.is_alive():
+            return
+        _ip_refresh_stop.clear()
+
+        def _loop():
+            while not _ip_refresh_stop.wait(interval):
+                try:
+                    _run_dynamic_proxy_ip_refresh(log_callback=log_callback)
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(
+                            f"[!] 动态节点 IP 刷新失败: {redact_sensitive_log_line(str(exc))}"
+                        )
+
+        _ip_refresh_thread = threading.Thread(
+            target=_loop,
+            name="proxy-ip-refresh",
+            daemon=True,
+        )
+        _ip_refresh_thread.start()
+        if log_callback:
+            log_callback(f"[*] 动态节点出口 IP 每 {interval}s 自动探测，变化后清除风控")
+
+
 def record_proxy_boot_failure(proxy: str, exc) -> None:
     """Apply runtime cooldown to managed proxies without touching legacy entries."""
     message = str(exc or "")
@@ -783,6 +915,8 @@ def record_proxy_boot_failure(proxy: str, exc) -> None:
         _record_managed_proxy_result(proxy, outcome, message)
     except Exception:
         pass
+    if proxy:
+        _exclude_proxy_until_exit_ip_changes(str(proxy))
 
 
 def _record_proxy_precheck_failure(proxy: str, checks) -> bool:
@@ -807,8 +941,12 @@ _MAIL_DIRECT_PATH_MARKERS = (
 
 def _url_needs_direct(url: str) -> bool:
     u = str(url or "").lower()
+    cloudflare_base = str(config.get("cloudflare_api_base") or "").strip().lower().rstrip("/")
+    # CPA 的成功实现让 Cloudflare Worker API 跟随当前绑定代理；只有代理请求
+    # 连接失败时，http_get/http_post 才会走下面的直连回退。
+    if cloudflare_base and (u == cloudflare_base or u.startswith(cloudflare_base + "/")):
+        return False
     configured_bases = (
-        config.get("cloudflare_api_base"),
         config.get("cloudmail_url"),
         config.get("moemail_api_base"),
         config.get("duckmail_api_base"),
@@ -822,7 +960,7 @@ def _url_needs_direct(url: str) -> bool:
 
 
 def _apply_mail_direct(url, request_kwargs: dict) -> dict:
-    """邮箱 Worker API 强制直连，避免经住宅代理 TLS 失败。"""
+    """为非 Cloudflare 邮箱 Worker 保留直连策略。"""
     if _url_needs_direct(url):
         rk = dict(request_kwargs)
         rk["proxies"] = {}
@@ -1041,7 +1179,7 @@ def _registration_risk_should_block(state: dict) -> tuple:
     升级后额外拦住：
       - botFlagSource in (1, 2)（含 IP farm soft-flag / castle 等）
       - policy=deny 且 event 非 registration（如 $login）
-    读不到风控字段时不硬拦，交给上层继续。
+    风控字段是否可用由上层单独判定；这里仅识别已读出的拒绝状态。
     """
     if not isinstance(state, dict):
         return False, ""
@@ -1063,6 +1201,142 @@ def _registration_risk_should_block(state: dict) -> tuple:
         return True, details or ("policy=deny,event=%s" % (event or "unknown"))
 
     return False, ""
+
+
+def _registration_risk_state_is_usable(state: dict) -> bool:
+    """是否已读到可判定的 botFlagSource（0/1/2）。"""
+    if not isinstance(state, dict) or not state.get("found"):
+        return False
+    return state.get("bot_flag_source") in (0, 1, 2)
+
+
+def _registration_risk_check_is_unavailable(state: dict) -> bool:
+    """页面没读到风控字段（Cloudflare / 导航失败等），不是已确认的拒绝。"""
+    if _registration_risk_should_block(state)[0]:
+        return False
+    return not _registration_risk_state_is_usable(state)
+
+
+def _is_transient_risk_navigation_error(exc) -> bool:
+    msg = str(exc or "")
+    low = msg.lower()
+    return (
+        "ns_binding_aborted" in low
+        or "frame was detached" in low
+        or "target closed" in low
+        or "targetclosed" in low
+        or is_proxy_navigation_failure(exc)
+    )
+
+
+def inspect_sso_registration_state_via_browser(
+    raw_token,
+    log_callback=None,
+    timeout: float = 10.0,
+    poll_interval: float = 0.5,
+) -> dict:
+    """在当前注册浏览器内读取 grok.com 的 botFlag 状态。
+
+    直连 HTTP 经常被 Cloudflare 拦截，不能据此把未知账号送进 CPA。这个
+    检查复用刚完成注册的浏览器上下文，并只返回脱敏的状态字段。
+    """
+    result = _s2cpa._parse_grok_account_state("")
+    result.update({"status_code": 0, "url": "", "error": "", "source": "browser"})
+    token = _normalize_sso_token(raw_token)
+    if not token:
+        result["error"] = "sso 为空"
+        return result
+
+    page_obj = _active_page()
+    if page_obj is None:
+        result["error"] = "注册浏览器页面未就绪"
+        return result
+
+    try:
+        # 账户刚注册完成时通常已携带这些 cookie；重复设置用于确保 grok.com
+        # 页面和 x.ai SSO 域都使用当前这条 SSO。
+        page_obj.set.cookies(
+            [
+                {"name": "sso", "value": token, "domain": ".x.ai", "path": "/"},
+                {"name": "sso-rw", "value": token, "domain": ".x.ai", "path": "/"},
+                {"name": "sso", "value": token, "domain": ".grok.com", "path": "/"},
+                {"name": "sso-rw", "value": token, "domain": ".grok.com", "path": "/"},
+            ]
+        )
+    except Exception:
+        # 页面已经登录时 cookie 写入失败不代表读取一定失败，继续读取实际页面。
+        if log_callback:
+            log_callback("[风控] 浏览器写入 SSO cookie 失败，继续检查现有会话")
+
+    def _open_risk_page() -> None:
+        page_obj.get(f"https://grok.com/?risk_check={secrets.token_urlsafe(8)}")
+        try:
+            page_obj.wait.doc_loaded()
+        except Exception:
+            pass
+
+    try:
+        _open_risk_page()
+    except Exception as exc:
+        if _is_transient_risk_navigation_error(exc):
+            try:
+                time.sleep(0.3)
+                _open_risk_page()
+            except Exception as retry_exc:
+                result["url"] = str(getattr(page_obj, "url", "") or "")
+                result["error"] = f"浏览器打开 grok.com 失败: {retry_exc}"
+                return result
+        else:
+            result["url"] = str(getattr(page_obj, "url", "") or "")
+            result["error"] = f"浏览器打开 grok.com 失败: {exc}"
+            return result
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    last_cf_challenge = False
+    while True:
+        try:
+            html = str(
+                page_obj.run_js("return document.documentElement.outerHTML || '';")
+                or ""
+            )
+            title = str(page_obj.run_js("return document.title || '';") or "")
+            body = str(
+                page_obj.run_js(
+                    "return (document.body && (document.body.innerText || '')) || '';"
+                )
+                or ""
+            )
+            result["url"] = str(getattr(page_obj, "url", "") or "")
+            result["status_code"] = 200
+        except Exception as exc:
+            result["error"] = f"读取浏览器页面失败: {exc}"
+            return result
+
+        parsed = _s2cpa._parse_grok_account_state(html)
+        result.update(parsed)
+        if parsed.get("found"):
+            result["error"] = ""
+            return result
+
+        page_text = f"{title}\n{body[:600]}\n{html[:1200]}".lower()
+        current_url = str(result.get("url") or "").lower()
+        if "sign-in" in current_url or "sign-up" in current_url:
+            result["error"] = "浏览器被重定向到 xAI 登录页，SSO 未生效或已失效"
+            return result
+        last_cf_challenge = (
+            "just a moment" in page_text
+            or "checking your browser" in page_text
+            or "cf-chl-" in page_text
+        )
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(max(0.0, float(poll_interval)))
+
+    if last_cf_challenge:
+        result["error"] = "grok.com 浏览器仍停在 Cloudflare 挑战页"
+    else:
+        result["error"] = "grok.com 浏览器页面未发现 botFlag 字段"
+    return result
 
 
 def ensure_sso_oauth_eligible(raw_token, email="", log_callback=None) -> dict:
@@ -1096,25 +1370,45 @@ def ensure_sso_oauth_eligible(raw_token, email="", log_callback=None) -> dict:
 
 
 def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
-    """SSO → Device Flow（失败回退授权码）换 token → 写入 CPA / Grok2API。
+    """按独立开关输出单行 SSO，并按需执行 SSO → Device Flow 换 token 写入 CPA。
 
     返回 True 表示入库成功（或未开启/无需转换）；False 表示转换失败（SSO 仍可能已写入 accounts）。
     """
+    g2a_dir = str(config.get("grok2api_auth_dir", "") or "").strip()
+    if g2a_dir and not os.path.isabs(g2a_dir):
+        g2a_dir = os.path.join(APP_DIR, g2a_dir)
+    g2a_enabled = config.get("grok2api_auto_add", True)
+    if isinstance(g2a_enabled, str):
+        g2a_enabled = g2a_enabled.strip().lower() in ("1", "true", "yes", "on")
+    raw_g2a_written = False
+    if g2a_enabled and g2a_dir:
+        try:
+            raw_sso = _normalize_sso_token(raw_token)
+            gpath = _s2cpa.write_grok2api_raw_sso(
+                _s2cpa.Path(g2a_dir), raw_sso, email=email
+            )
+            raw_g2a_written = True
+            if log_callback:
+                log_callback(f"[*] 已追加 Grok2API SSO → {gpath}")
+        except Exception as raw_exc:
+            if log_callback:
+                log_callback(f"[CPA] Grok2API 单行 SSO 写入失败: {raw_exc}")
+            if not config.get("cpa_auto_add", False):
+                return False
     if not config.get("cpa_auto_add", False):
         if log_callback:
-            log_callback("[*] 已关闭 SSO→auth，仅保存 SSO（不写 auth）")
-        return True
+            log_callback(
+                "[*] 已关闭 SSO→auth，仅保存 SSO（不换 OAuth、不写 CPA）"
+                + ("；Grok2API 输出已关闭" if not g2a_enabled else "")
+            )
+        return raw_g2a_written if g2a_enabled else True
     auth_dir = str(config.get("cpa_auth_dir", "") or "").strip()
     remote_url = str(config.get("cpa_remote_url", "") or "").strip()
     management_key = str(config.get("cpa_management_key", "") or "").strip()
-    g2a_dir = str(config.get("grok2api_auth_dir", "") or "").strip()
 
     # 相对路径基于项目根目录解析，并自动创建目录
     if auth_dir and not os.path.isabs(auth_dir):
         auth_dir = os.path.join(APP_DIR, auth_dir)
-    if g2a_dir and not os.path.isabs(g2a_dir):
-        g2a_dir = os.path.join(APP_DIR, g2a_dir)
-
     if not auth_dir and not remote_url and not g2a_dir:
         if log_callback:
             log_callback(
@@ -1267,9 +1561,6 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
                 except Exception:
                     pass
         wrote_ok = False
-        quality_extra = {
-            key: record[key] for key in record if str(key).startswith("quality_")
-        }
         if auth_dir:
             try:
                 path = _s2cpa.write_cpa_auth(_s2cpa.Path(auth_dir), record)
@@ -1284,18 +1575,8 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
                 wrote_ok = True
             except Exception as remote_exc:
                 _cpa_log(f"CPA 远程上传失败: {remote_exc}")
-        if g2a_dir:
-            try:
-                gpath = _s2cpa.write_grok2api_auth(
-                    _s2cpa.Path(g2a_dir),
-                    token,
-                    email=email,
-                    extra=quality_extra,
-                )
-                _cpa_log(f"已写入 Grok2API {gpath}")
-                wrote_ok = True
-            except Exception as g2a_exc:
-                _cpa_log(f"Grok2API 写入失败: {g2a_exc}")
+        if raw_g2a_written:
+            wrote_ok = True
         if not wrote_ok:
             _cpa_log("token 已换出但 CPA/Grok2API 均未写入成功")
             _append_sso_pending(email, sso, log_callback=log_callback)
@@ -1939,6 +2220,13 @@ def get_outlook_rt_client_id():
     )
 
 
+def outlook_rt_skip_empty_inbox_enabled() -> bool:
+    raw = config.get("outlook_rt_skip_empty_inbox", False)
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(raw)
+
+
 def outlook_rt_take_mailbox():
     inv = get_outlook_rt_inventory()
     if not inv:
@@ -1946,7 +2234,7 @@ def outlook_rt_take_mailbox():
             "请在配置中填写 outlook_rt_inventory（jsonl/文本库存路径，"
             "字段 email + refresh_token）"
         )
-    # 取号后立刻 refresh + Inbox 预检：空箱/死 RT 秒退并 mark used
+    # 取号后立刻 refresh；Inbox 预检可选，默认不跳过空箱（空箱是正常初始状态）
     def _log(msg: str) -> None:
         try:
             cli_log(msg)
@@ -1961,7 +2249,7 @@ def outlook_rt_take_mailbox():
         http_get=http_get,
         log_callback=_log,
         max_attempts=20,
-        skip_empty_inbox=True,
+        skip_empty_inbox=outlook_rt_skip_empty_inbox_enabled(),
     )
 
 
@@ -3133,7 +3421,7 @@ class GrokRegisterGUI:
         # SSO → CPA auth 可选
         self.cpa_frame = tk.LabelFrame(
             config_frame,
-            text="SSO → CPA auth（可选）",
+            text="SSO 输出与 CPA（可选）",
             bg=UI_PANEL_BG,
             fg=UI_FG,
             padx=8,
@@ -3148,11 +3436,21 @@ class GrokRegisterGUI:
         self.cpa_auto_add_var = tk.BooleanVar(value=bool(config.get("cpa_auto_add", False)))
         tk_checkbutton(
             self.cpa_frame,
-            text="开启后注册成功：SSO 换 token，写入 CPA / Grok2API（不勾选则只保存 SSO）",
+            text="开启后注册成功：SSO 换 token，写入 CPA",
             variable=self.cpa_auto_add_var,
         ).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=3)
 
+        self.grok2api_auto_add_var = tk.BooleanVar(
+            value=bool(config.get("grok2api_auto_add", True))
+        )
+        tk_checkbutton(
+            self.cpa_frame,
+            text="注册成功后输出 Grok2API：目录内单文件，一行一个 SSO",
+            variable=self.grok2api_auto_add_var,
+        ).grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=3)
+
         self._cpa_detail_widgets = []
+        self._grok2api_widgets = []
         quality_on = config.get("quality_probe_on_register", False)
         if isinstance(quality_on, str):
             quality_on = quality_on.strip().lower() not in ("0", "false", "no", "off")
@@ -3162,7 +3460,7 @@ class GrokRegisterGUI:
             text="写入 auth 后短测降智（默认关；勾选才测，短题，见到 thinking 即停）",
             variable=self.quality_probe_on_register_var,
         )
-        quality_check.grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=3)
+        quality_check.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=3)
         self._cpa_detail_widgets.append(quality_check)
         def c_label(row, col, text):
             w = tk_label(self.cpa_frame, text=text, bg=UI_PANEL_BG)
@@ -3175,6 +3473,17 @@ class GrokRegisterGUI:
             self._cpa_detail_widgets.append(widget)
             return widget
 
+        def g_label(row, col, text):
+            w = tk_label(self.cpa_frame, text=text, bg=UI_PANEL_BG)
+            w.grid(row=row, column=col, sticky=tk.W, padx=(0, 6), pady=3)
+            self._grok2api_widgets.append(w)
+            return w
+
+        def g_field(widget, row, col, columnspan=1, sticky=tk.EW):
+            widget.grid(row=row, column=col, columnspan=columnspan, sticky=sticky, padx=(0, 14), pady=3)
+            self._grok2api_widgets.append(widget)
+            return widget
+
         # Token 换取方式选择
         _cur_mode = str(config.get("cpa_token_mode", "device_protocol") or "device_protocol")
         _mode_display = {
@@ -3183,33 +3492,35 @@ class GrokRegisterGUI:
             "auth_code": "Authorization Code",
         }.get(_cur_mode, "协议 Device Flow")
         self.cpa_token_mode_var = tk.StringVar(value=_mode_display)
-        c_label(2, 0, "Token 换取:")
+        c_label(3, 0, "Token 换取:")
         token_mode_menu = tk_option_menu(
             self.cpa_frame,
             self.cpa_token_mode_var,
             ["协议 Device Flow", "浏览器 Device Flow", "Authorization Code"],
             width=20,
         )
-        c_field(token_mode_menu, 2, 1)
-        c_label(2, 2, "（默认协议换 token；浏览器模式需活动浏览器）")
+        c_field(token_mode_menu, 3, 1)
+        c_label(3, 2, "（默认协议换 token；浏览器模式需活动浏览器）")
 
         self.cpa_auth_dir_var = tk.StringVar(value=str(config.get("cpa_auth_dir", "")))
         self.cpa_remote_url_var = tk.StringVar(value=str(config.get("cpa_remote_url", "")))
         self.cpa_management_key_var = tk.StringVar(value=str(config.get("cpa_management_key", "")))
         self.grok2api_auth_dir_var = tk.StringVar(value=str(config.get("grok2api_auth_dir", "")))
-        c_label(3, 0, "CPA auth 目录:")
-        c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_auth_dir_var, width=52), 3, 1, columnspan=3)
-        c_label(4, 0, "远程地址:")
-        c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_remote_url_var, width=34), 4, 1)
-        c_label(4, 2, "管理密钥:")
-        c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_management_key_var, width=28), 4, 3)
-        c_label(5, 0, "Grok2API 目录:")
-        c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_auth_dir_var, width=52), 5, 1, columnspan=3)
+        c_label(4, 0, "CPA auth 目录:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_auth_dir_var, width=52), 4, 1, columnspan=3)
+        c_label(5, 0, "远程地址:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_remote_url_var, width=34), 5, 1)
+        c_label(5, 2, "管理密钥:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_management_key_var, width=28), 5, 3)
+        g_label(6, 0, "Grok2API 目录:")
+        g_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_auth_dir_var, width=52), 6, 1, columnspan=3)
 
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
+        self.grok2api_auto_add_var.trace_add("write", lambda *_: self._refresh_grok2api_fields())
         self._refresh_provider_fields()
         self._refresh_cpa_fields()
+        self._refresh_grok2api_fields()
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
@@ -3298,9 +3609,17 @@ class GrokRegisterGUI:
             widget.grid()
 
     def _refresh_cpa_fields(self):
-        """未开启 SSO→auth 时隐藏 CPA 目录/远程配置。"""
+        """未开启 SSO→auth 时隐藏 CPA 专属配置。"""
         enabled = bool(self.cpa_auto_add_var.get())
         for widget in getattr(self, "_cpa_detail_widgets", []):
+            if enabled:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+    def _refresh_grok2api_fields(self):
+        enabled = bool(self.grok2api_auto_add_var.get())
+        for widget in getattr(self, "_grok2api_widgets", []):
             if enabled:
                 widget.grid()
             else:
@@ -3403,6 +3722,7 @@ class GrokRegisterGUI:
             config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
             config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
             config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+            config["grok2api_auto_add"] = bool(self.grok2api_auto_add_var.get())
             config["grok2api_auth_dir"] = self.grok2api_auth_dir_var.get().strip()
         except Exception:
             pass
@@ -3526,6 +3846,7 @@ class GrokRegisterGUI:
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
         config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+        config["grok2api_auto_add"] = bool(self.grok2api_auto_add_var.get())
         config["grok2api_auth_dir"] = self.grok2api_auth_dir_var.get().strip()
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
@@ -3573,8 +3894,11 @@ class GrokRegisterGUI:
             if missing:
                 self.log(f"[!] CloudMail 模式缺少配置: {', '.join(missing)}")
                 return
-        if config.get("cpa_auto_add") and not config.get("cpa_auth_dir") and not config.get("cpa_remote_url") and not config.get("grok2api_auth_dir"):
-            self.log("[!] 已开启 SSO→auth，但未配置 CPA auth 目录 / 远程地址 / Grok2API 目录")
+        if config.get("cpa_auto_add") and not config.get("cpa_auth_dir") and not config.get("cpa_remote_url"):
+            self.log("[!] 已开启 SSO→auth，但未配置 CPA auth 目录或远程地址")
+            return
+        if config.get("grok2api_auto_add", True) and not config.get("grok2api_auth_dir"):
+            self.log("[!] 已开启 Grok2API 输出，但未配置 Grok2API 目录")
             return
         try:
             count = int(self.count_var.get())
@@ -3642,6 +3966,9 @@ class GrokRegisterGUI:
             f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（仅保存 SSO）'}"
             + (f"（{_mode_label}）" if config.get("cpa_auto_add") else "")
             + (" | 入库后短测降智" if config.get("cpa_auto_add") and _quality_on else "")
+        )
+        self.log(
+            f"[*] Grok2API 单行 SSO 输出: {'开' if config.get('grok2api_auto_add', True) else '关'}"
         )
         threading.Thread(
             target=self._run_registration_entry,
@@ -3785,7 +4112,11 @@ class GrokRegisterGUI:
                         email=email,
                         password=profile.get("password", ""),
                     )
-                    ensure_sso_oauth_eligible(sso, email=email, log_callback=wlog)
+                    risk_state = ensure_sso_oauth_eligible(
+                        sso, email=email, log_callback=wlog
+                    )
+                    if risk_state.get("rotate_proxy"):
+                        wlog("[*] 风控页不可用，下号换节点")
                     if config.get("enable_nsfw", True):
                         wlog("[*] 6. 开启 NSFW（失败不阻塞入库）")
                         try:
@@ -3958,6 +4289,7 @@ def run_registration_cli(count):
     except Exception:
         pass
     pool = load_proxy_pool()
+    _startup_excluded_proxies.clear()
     cli_log(
         f"[*] 终端模式启动，目标数量: {count} | 并发: {workers} | "
         f"代理池: {len(pool)} ({_proxy_pool_source})"
@@ -3983,7 +4315,35 @@ def run_registration_cli(count):
     try:
         startup_config = dict(config)
         if pool:
-            startup_config["proxy"] = pool[0]
+            # 代理池的第一条可能刚好在动态切换或 TLS 冷却中。只要池内仍有
+            # 一条能打开 xAI 注册页，就继续使用该出口，不让瞬时故障拖停整批。
+            selected_proxy = ""
+            for candidate in pool:
+                candidate_checks = [
+                    _conn.check_proxy(candidate, http_get),
+                    _conn.check_xai_signup(candidate, http_get),
+                ]
+                xai_ok = next(
+                    (ok for name, ok, _ in candidate_checks if name == _conn.XAI_SIGNUP_CHECK_NAME),
+                    False,
+                )
+                if xai_ok:
+                    selected_proxy = candidate
+                    break
+                _exclude_proxy_until_exit_ip_changes(candidate)
+                _record_proxy_precheck_failure(candidate, candidate_checks)
+                detail = next(
+                    (detail for name, ok, detail in candidate_checks if name == _conn.XAI_SIGNUP_CHECK_NAME and not ok),
+                    "xAI 注册页不可达",
+                )
+                cli_log(
+                    f"[检查] [FAIL] 代理候选 {redact_sensitive_log_line(candidate)}: "
+                    f"{redact_sensitive_log_line(detail)}；尝试下一节点"
+                )
+            if selected_proxy:
+                startup_config["proxy"] = selected_proxy
+            else:
+                startup_config["proxy"] = pool[0]
         startup_checks = _conn.run_connectivity_checks(startup_config, http_get, http_post)
         for name, ok, detail in startup_checks:
             cli_log(
@@ -4064,6 +4424,7 @@ def run_registration_cli(count):
                             or "无法解析出口 IP" in msgb
                             or "代理不可用或过慢" in msgb
                             or "Failed to get IP" in msgb
+                            or is_proxy_navigation_failure(last_boot)
                         ):
                             break
                         rotate_idx += 1
@@ -4133,7 +4494,7 @@ def run_registration_cli(count):
                             email=email,
                             password=profile.get("password", ""),
                         )
-                        ensure_sso_oauth_eligible(
+                        risk_state = ensure_sso_oauth_eligible(
                             sso,
                             email=email,
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
@@ -4176,12 +4537,17 @@ def run_registration_cli(count):
                             kind="success",
                             detail="cpa_ok" if cpa_ok else "cpa_fail",
                             worker=f"W{wid+1}",
-                            bot_flag=0,
+                            bot_flag=risk_state.get("bot_flag_source"),
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                         )
                         mark_slot_completed()
-                        # 每成功 3 个换 sticky / IP
-                        if local_success % 3 == 0:
+                        # 风控页读不到时立刻换口；否则每成功 N 个换 sticky / IP
+                        if risk_state.get("rotate_proxy"):
+                            rotate_idx += 1
+                            cli_log(
+                                f"[W{wid+1}] [*] 风控页不可用，下号换节点 #{rotate_idx}"
+                            )
+                        elif local_success % PROXY_SUCCESS_ROTATE_EVERY == 0:
                             rotate_idx += 1
                             cli_log(f"[W{wid+1}] [*] 已成功 {local_success} 个，下号换 IP #{rotate_idx}")
                     except RegistrationCancelled:
@@ -4232,6 +4598,7 @@ def run_registration_cli(count):
                             or "代理不可用或过慢" in msg
                             or "出口IP命中黑名单" in msg
                             or "命中黑名单" in msg
+                            or is_proxy_navigation_failure(exc)
                         )
                         pipe_dead = (
                             "epipe" in msg.lower()
@@ -4257,12 +4624,20 @@ def run_registration_cli(count):
                         if (blank_ui or proxy_dead or pipe_dead or turnstile_stuck or profile_soft) and retry < max_slot_retry:
                             retry += 1
                             why = (
-                                "Playwright管道断开"
-                                if pipe_dead
+                                "代理连接重置"
+                                if is_proxy_navigation_failure(exc)
                                 else (
-                                    "Turnstile卡住"
-                                    if turnstile_stuck
-                                    else ("资料页未就绪" if profile_soft else "空页/表单未就绪")
+                                    "Playwright管道断开"
+                                    if pipe_dead
+                                    else (
+                                        "Turnstile卡住"
+                                        if turnstile_stuck
+                                        else (
+                                            "资料页未就绪"
+                                            if profile_soft
+                                            else "空页/表单未就绪"
+                                        )
+                                    )
                                 )
                             )
                             cli_log(
@@ -4316,8 +4691,6 @@ def run_registration_cli(count):
                             FAIL_PROFILE,
                         ):
                             rotate_idx += 1
-                        elif local_success > 0 and local_success % 3 == 0:
-                            rotate_idx += 1
                     finally:
                         if i < n and not controller.should_stop():
                             try:
@@ -4353,6 +4726,7 @@ def run_registration_cli(count):
                                             "出口IP命中黑名单" in msgb
                                             or "无法解析出口 IP" in msgb
                                             or "代理不可用或过慢" in msgb
+                                            or is_proxy_navigation_failure(last_boot)
                                         ):
                                             break
                                         rotate_idx += 1
@@ -4523,7 +4897,9 @@ def run_registration_cli(count):
                     email=email,
                     password=profile.get("password", ""),
                 )
-                ensure_sso_oauth_eligible(sso, email=email, log_callback=cli_log)
+                risk_state = ensure_sso_oauth_eligible(
+                    sso, email=email, log_callback=cli_log
+                )
                 if config.get("enable_nsfw", True):
                     cli_log("[*] 6. 开启 NSFW")
                     nsfw_ok, nsfw_msg = enable_nsfw_for_token(
@@ -4557,10 +4933,13 @@ def run_registration_cli(count):
                     kind="success",
                     detail="cpa_ok" if cpa_ok else "cpa_fail",
                     worker="W1",
-                    bot_flag=0,
+                    bot_flag=risk_state.get("bot_flag_source"),
                     log_callback=cli_log,
                 )
-                if success_count % 2 == 0:
+                if risk_state.get("rotate_proxy"):
+                    single_rotate_idx += 1
+                    cli_log("[*] 风控页不可用，下号换节点")
+                elif success_count % PROXY_SUCCESS_ROTATE_EVERY == 0:
                     single_rotate_idx += 1
                 cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
                 mark_slot_completed()
@@ -4628,7 +5007,7 @@ def run_registration_cli(count):
                         "出口IP命中黑名单",
                         "命中黑名单",
                     )
-                )
+                ) or is_proxy_navigation_failure(exc)
                 pipe_dead = any(
                     marker in message.lower()
                     for marker in (

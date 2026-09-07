@@ -8,10 +8,68 @@ import string
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from email_providers.common import extract_verification_code, generate_username, pick_list_payload, random_subdomain_domain
+from email_providers.common import (
+    _score_code,
+    decode_raw_message,
+    extract_verification_code,
+    generate_username,
+    pick_list_payload,
+)
 
 HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
+
+_MESSAGE_TEXT_FIELDS = ("text", "raw", "content", "intro", "body", "snippet")
+_CODE_CANDIDATE_RE = re.compile(r"\b([A-Za-z0-9]{3}-[A-Za-z0-9]{3})\b")
+
+
+def _safe_message_shape(message: Any) -> str:
+    """Return mailbox message structure without logging addresses or content."""
+    if not isinstance(message, dict):
+        return f"type={type(message).__name__}"
+    body_lengths = {
+        field: len(value)
+        for field in _MESSAGE_TEXT_FIELDS
+        if isinstance((value := message.get(field)), str) and value
+    }
+    html_value = message.get("html")
+    if isinstance(html_value, list):
+        html_shape = f"list:{len(html_value)}"
+    elif isinstance(html_value, str):
+        html_shape = f"str:{len(html_value)}"
+    elif html_value is None:
+        html_shape = "none"
+    else:
+        html_shape = type(html_value).__name__
+    return (
+        f"id={message.get('id') or message.get('msgid') or '-'} "
+        f"keys={sorted(str(key) for key in message.keys())} "
+        f"subject_len={len(str(message.get('subject') or ''))} "
+        f"to_count={len(message.get('to') or []) if isinstance(message.get('to') or [], list) else 0} "
+        f"address_present={bool(message.get('address'))} "
+        f"body_lengths={body_lengths} html={html_shape}"
+    )
+
+
+def _safe_code_diagnostics(text: str) -> str:
+    """Describe extraction inputs without exposing message content or codes."""
+    value = str(text or "")
+    matches = list(_CODE_CANDIDATE_RE.finditer(value))
+    candidates = [match.group(1) for match in matches]
+    numeric = [candidate for candidate in candidates if candidate.replace("-", "").isdigit()]
+    scores = [_score_code(match.group(1), value, match.start()) for match in matches]
+    numeric_scores = [
+        score
+        for match, score in zip(matches, scores)
+        if match.group(1).replace("-", "").isdigit()
+    ]
+    lower = value.lower()
+    return (
+        f"decoded_len={len(value)} candidates={len(candidates)} numeric={len(numeric)} "
+        f"scores={scores} numeric_scores={numeric_scores} "
+        f"has_xai={'xai' in lower} has_spacexai={'spacexai' in lower} "
+        f"has_verification={'verification' in lower} has_confirmation={'confirmation' in lower}"
+    )
 
 
 def path_from_config(config: dict, key: str, default_path: str) -> str:
@@ -89,9 +147,6 @@ def create_temp_address(
     path = accounts_path if accounts_path.startswith("/") else f"/{accounts_path}"
     url = f"{api_base.rstrip('/')}{path}"
     selected_domain = str(domain or "").strip()
-    # 根域批量易被标；默认挂随机子域（需 CF Email Routing 对 *.apex catch-all）
-    if selected_domain and randomize_subdomain:
-        selected_domain = random_subdomain_domain(selected_domain)
 
     last_err: Exception | None = None
     # 并发 worker 容易撞同名 → 400 Address already exists；最多换名重试 4 次
@@ -101,14 +156,18 @@ def create_temp_address(
             # 追加短随机后缀，降低 james.smith 这类撞车
             local_name = f"{generate_username(10)}{secrets.token_hex(2)}"
         if is_admin_create_path(path):
-            payload = {"name": local_name, "enablePrefix": False}
+            payload = {"name": local_name, "enablePrefix": True}
             if selected_domain:
                 payload["domain"] = selected_domain
+            if randomize_subdomain:
+                payload["enableRandomSubdomain"] = True
             headers = build_headers(api_key, auth_mode, custom_auth, content_type=True)
         else:
             payload = {}
             if selected_domain:
                 payload["domain"] = selected_domain
+            if randomize_subdomain:
+                payload["enableRandomSubdomain"] = True
             headers = apply_custom_auth({"Content-Type": "application/json"}, custom_auth)
         try:
             resp = http_post(url, json=payload, headers=headers)
@@ -408,6 +467,11 @@ def wait_for_code(
             continue
         if log_callback:
             log_callback(f"[Debug] Cloudflare 本轮邮件数量: {len(messages)}")
+            if messages:
+                log_callback(
+                    "[Debug] Cloudflare 邮件结构: "
+                    + " | ".join(_safe_message_shape(message) for message in messages[:5])
+                )
         for msg in messages:
             msg_id = msg.get("id") or msg.get("msgid")
             if not msg_id:
@@ -432,6 +496,8 @@ def wait_for_code(
             for field in ("text", "raw", "content", "intro", "body", "snippet"):
                 value = msg.get(field)
                 if isinstance(value, str) and value.strip():
+                    if field == "raw":
+                        value = decode_raw_message(value)
                     parts.append(value)
             html_list = msg.get("html") or []
             if isinstance(html_list, str):
@@ -451,9 +517,16 @@ def wait_for_code(
                     auth_mode=auth_mode,
                     custom_auth=custom_auth,
                 )
+                if log_callback:
+                    log_callback(
+                        "[Debug] Cloudflare 邮件详情结构: "
+                        + _safe_message_shape(detail)
+                    )
                 for field in ("text", "raw", "content", "intro", "body", "snippet"):
                     value = detail.get(field)
                     if isinstance(value, str) and value.strip():
+                        if field == "raw":
+                            value = decode_raw_message(value)
                         combined += "\n" + value
                 html_list2 = detail.get("html") or []
                 if isinstance(html_list2, str):
@@ -467,6 +540,10 @@ def wait_for_code(
                     log_callback(f"[Debug] Cloudflare detail接口失败，改用列表内容解析: {exc}")
             if log_callback:
                 log_callback(f"[Debug] Cloudflare 收到邮件: {subject}")
+                log_callback(
+                    "[Debug] Cloudflare 验证码输入诊断: "
+                    + _safe_code_diagnostics(f"{subject}\n{combined}")
+                )
             code = extract_verification_code(combined, subject)
             if code:
                 if log_callback:

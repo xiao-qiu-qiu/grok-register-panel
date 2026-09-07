@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -149,6 +150,42 @@ def test_monitor_http_auth_and_headers():
             os.environ["MONITOR_TOKEN"] = previous
 
 
+def test_parse_log_counts_failures_without_email():
+    with tempfile.TemporaryDirectory() as temp:
+        log = Path(temp) / "batch.log"
+        log.write_text(
+            "[18:00:00] [batch] count=3 workers=1\n"
+            "[18:00:01] [+] 注册成功: person@example.test\n"
+            "[18:00:02] [结果] status=ok ip=203.0.113.9 port=8003 email=pe***@example.test email_used=1 kind=success bot=0 risk=- bfs=-\n"
+            "[18:00:03] [-] 失败 [浏览器断开]: Page.goto: NS_BINDING_ABORTED\n"
+            "[18:00:04] [结果] status=fail ip=203.0.113.9 port=8003 email=- email_used=0 kind=browser bot=- risk=- bfs=-\n"
+            "[18:00:05] [-] 失败 [验证码超时]: Outlook RT 超时\n"
+            "[18:00:06] [结果] status=fail ip=203.0.113.9 port=8003 email=ot***@example.test email_used=1 kind=code_timeout bot=- risk=- bfs=-\n",
+            encoding="utf-8",
+        )
+        parsed = monitor.parse_log(log)
+        assert parsed["ok"] == 1
+        assert parsed["fail"] == 2
+        assert parsed["fail_no_email"] == 1
+
+
+def test_parse_log_large_file_does_not_require_grep():
+    with tempfile.TemporaryDirectory() as temp:
+        log = Path(temp) / "batch-large.log"
+        filler = ("x" * 120 + "\n") * 4000
+        body = (
+            filler
+            + "[18:00:00] [batch] count=2 workers=1\n"
+            + "[18:00:01] [+] 注册成功: person@example.test\n"
+            + "[18:00:02] [-] 失败 [浏览器断开]: Page.goto: NS_BINDING_ABORTED\n"
+        )
+        log.write_text(body, encoding="utf-8")
+        assert log.stat().st_size > 400_000
+        parsed = monitor.parse_log(log)
+        assert parsed["ok"] == 1
+        assert parsed["fail"] == 1
+
+
 def test_panel_registration_env_enables_guarded_cache():
     previous_enabled = os.environ.pop("GROK_STATIC_ASSET_CACHE", None)
     previous_dir = os.environ.pop("GROK_STATIC_CACHE_DIR", None)
@@ -219,7 +256,41 @@ def test_proxy_api_auth_mutations_and_redaction():
             status, _, body = request(base + "/api/proxies", token=token)
             assert status == 200
             assert secret not in body.decode("utf-8")
-            assert json.loads(body)["items"][0]["has_auth"] is True
+            pool = json.loads(body)
+            assert pool["items"][0]["has_auth"] is True
+            assert "exit_ip_refresh" in pool
+
+            status, _, _ = request(
+                base + "/api/proxies/refresh-exit-ip",
+                method="POST",
+                body=b'{"enabled":true}',
+            )
+            assert status == 401
+            previous_refresh = proxy_store.refresh_dynamic_exit_ips
+            proxy_store.refresh_dynamic_exit_ips = lambda **_kwargs: {
+                "ok": True,
+                "checked": 1,
+                "changed": [],
+                "cleared": [],
+                "failed": 0,
+            }
+            try:
+                status, _, body = request(
+                    base + "/api/proxies/refresh-exit-ip",
+                    token=token,
+                    method="POST",
+                    body=b'{"enabled":true}',
+                )
+                assert status in (200, 202)
+                payload = json.loads(body)
+                assert payload.get("ok") is True
+                assert payload.get("loop_enabled") is True
+                deadline = time.time() + 2
+                while proxy_store.exit_ip_refresh_status().get("running") and time.time() < deadline:
+                    time.sleep(0.01)
+            finally:
+                proxy_store.set_exit_ip_refresh_enabled(False)
+                proxy_store.refresh_dynamic_exit_ips = previous_refresh
 
             status, _, body = request(
                 base + f"/api/proxies/{proxy_id}",
@@ -514,6 +585,8 @@ if __name__ == "__main__":
     test_compat_process_roots_require_existing_absolute_paths()
     test_process_discovery_aggregates_explicit_release_roots()
     test_monitor_http_auth_and_headers()
+    test_parse_log_counts_failures_without_email()
+    test_parse_log_large_file_does_not_require_grep()
     test_panel_registration_env_enables_guarded_cache()
     test_proxy_api_auth_mutations_and_redaction()
     test_email_domain_api_auth_and_mutations()

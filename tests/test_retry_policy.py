@@ -56,8 +56,15 @@ def test_xai_precheck_failure_updates_managed_proxy_health():
     assert calls[0][1] == "network"
 
 
+def test_proxy_navigation_reset_is_retryable_and_browser_failure():
+    exc = RuntimeError("打开注册页失败: Page.goto: NS_ERROR_NET_RESET")
+    assert grok_register_ttk.is_proxy_navigation_failure(exc)
+    assert grok_register_ttk.classify_failure(exc) == grok_register_ttk.FAIL_BROWSER
+
+
 if __name__ == "__main__":
     test_defaults_are_bounded_and_overridable()
     test_xai_failure_is_explicitly_non_retryable()
     test_xai_precheck_failure_updates_managed_proxy_health()
+    test_proxy_navigation_reset_is_retryable_and_browser_failure()
     print("OK retry policy")

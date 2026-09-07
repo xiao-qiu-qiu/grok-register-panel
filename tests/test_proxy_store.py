@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
 import tempfile
@@ -76,7 +77,8 @@ def test_import_deduplicates_and_public_view_never_leaks_credentials():
         assert result["items"][0]["has_auth"] is True
         stored = proxy_store.STATE_PATH.read_text(encoding="utf-8")
         assert secret in stored
-        assert stat.S_IMODE(proxy_store.STATE_PATH.stat().st_mode) == 0o600
+        if os.name == "posix":
+            assert stat.S_IMODE(proxy_store.STATE_PATH.stat().st_mode) == 0o600
 
 
 def test_probe_result_and_runtime_cooldown_control_worker_selection():
@@ -238,6 +240,82 @@ def test_disable_delete_and_legacy_import():
         assert deleted["summary"]["total"] == 1
 
 
+def test_changed_exit_ip_clears_risk_cooldown():
+    with IsolatedStore():
+        imported = proxy_store.import_proxies("proxy.example:8080:user:pass")
+        proxy_id = imported["imported_ids"][0]
+        proxy_store._apply_probe_result(
+            proxy_id,
+            {
+                "ok": True,
+                "exit_ip": "203.0.113.9",
+                "asn": 64500,
+                "asn_org": "Example ISP",
+                "latency_ms": 100,
+                "checked_at": "2026-08-20T00:00:00Z",
+            },
+        )
+        url = proxy_store.list_worker_proxies()[0]
+        assert proxy_store.record_proxy_result(url, "risk", "botFlagSource=1")
+        same = proxy_store.apply_changed_exit_ip(url, "203.0.113.9")
+        assert same["ok"] is True
+        assert same["ip_changed"] is False
+        assert same["cleared"] is False
+        assert proxy_store.read_proxy_pool()["items"][0]["stored_status"] == "cooldown"
+
+        changed = proxy_store.apply_changed_exit_ip(url, "203.0.113.88")
+        assert changed["ip_changed"] is True
+        assert changed["cleared"] is True
+        item = proxy_store.read_proxy_pool()["items"][0]
+        assert item["stored_status"] == "cooldown"
+        assert item["cooldown_reason"] == "risk"
+        assert item["exit_ip"] == "203.0.113.88"
+        assert item["last_error"] == ""
+
+        imported_home = proxy_store.import_proxies("http://127.0.0.1:8003")
+        home_id = imported_home["imported_ids"][0]
+        proxy_store._apply_probe_result(
+            home_id,
+            {
+                "ok": True,
+                "exit_ip": "198.51.100.33",
+                "asn": 64500,
+                "asn_org": "Home",
+                "latency_ms": 80,
+                "checked_at": "2026-08-20T00:00:00Z",
+            },
+        )
+        home_url = "http://127.0.0.1:8003"
+        assert proxy_store.record_proxy_result(home_url, "risk", "botFlagSource=1")
+        home_before = next(item for item in proxy_store.read_proxy_pool()["items"] if item["id"] == home_id)
+        assert home_before["stored_status"] != "cooldown"
+        assert home_before["last_error"]
+        home_changed = proxy_store.apply_changed_exit_ip(home_url, "198.51.100.90")
+        assert home_changed["ip_changed"] is True
+        assert home_changed["cleared"] is True
+        home_after = next(item for item in proxy_store.read_proxy_pool()["items"] if item["id"] == home_id)
+        assert home_after["stored_status"] == "healthy"
+        assert home_after["last_error"] == ""
+        assert home_after["exit_ip"] == "198.51.100.90"
+
+        def fake_probe(target, timeout=8):
+            return {
+                "ok": True,
+                "exit_ip": "198.51.100.44",
+                "asn": 64500,
+                "asn_org": "Dynamic",
+                "checked_at": "2026-08-20T00:10:00Z",
+            }
+
+        proxy_store.record_proxy_result(url, "risk", "policy deny")
+        refreshed = proxy_store.refresh_dynamic_exit_ips(probe_fn=fake_probe)
+        assert refreshed["checked"] == 2
+        assert len(refreshed["cleared"]) >= 1
+        first = proxy_store.read_proxy_pool()["items"][0]
+        assert first["last_error"] == ""
+        assert first["stored_status"] == "cooldown"
+
+
 def test_async_probe_job_persists_health():
     with IsolatedStore():
         result = proxy_store.import_proxies("http://proxy.example:8080")
@@ -279,6 +357,7 @@ if __name__ == "__main__":
     test_normalize_proxy_formats_and_rejects_paths()
     test_import_deduplicates_and_public_view_never_leaks_credentials()
     test_probe_result_and_runtime_cooldown_control_worker_selection()
+    test_changed_exit_ip_clears_risk_cooldown()
     test_xai_probe_uses_registration_page_result()
     test_disable_delete_and_legacy_import()
     test_async_probe_job_persists_health()
